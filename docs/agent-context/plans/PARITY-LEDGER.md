@@ -8,7 +8,7 @@ Edit rules: one row per upstream entry point; never delete a row — set `droppe
 
 | Upstream | Milestone | Disposition | Status | Evidence |
 |---|---|---|---|---|
-| `mo analyze` | M1, M2 | Port | wip (M1 done) | plans/M1-analyzer.md |
+| `mo analyze` | M1, M2 | Port | wip (M1, M2.1 done) | plans/M1-analyzer.md; issue #4 progressive events, parallel hardlink dedupe, cancellation |
 | `mo status` | M9.1 | Adapt | todo | |
 | `mo clean` | M4–M6 | Adapt | todo | |
 | `mo purge` | M7.1 | Port | todo | |

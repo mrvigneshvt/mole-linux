@@ -46,11 +46,13 @@ fn analyze_json_keeps_partial_and_unavailable_states() {
     let root = Node {
         name: "root".into(),
         kind: EntryKind::Directory,
+        cleanable: false,
         apparent: 9,
         allocated: 9,
         children: vec![Node {
             name: "locked".into(),
             kind: EntryKind::Directory,
+            cleanable: false,
             apparent: 0,
             allocated: 0,
             children: Vec::new(),
@@ -72,12 +74,14 @@ fn analyze_json_reports_apparent_and_allocated_bytes_and_excluded_mounts() {
     let root = Node {
         name: "root".into(),
         kind: EntryKind::Directory,
+        cleanable: false,
         apparent: 4200,
         allocated: 8192,
         children: vec![
             Node {
                 name: "payload.bin".into(),
                 kind: EntryKind::File,
+                cleanable: false,
                 apparent: 100,
                 allocated: 4096,
                 children: Vec::new(),
@@ -86,6 +90,7 @@ fn analyze_json_reports_apparent_and_allocated_bytes_and_excluded_mounts() {
             Node {
                 name: "mounted".into(),
                 kind: EntryKind::Directory,
+                cleanable: false,
                 apparent: 0,
                 allocated: 0,
                 children: Vec::new(),

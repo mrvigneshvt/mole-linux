@@ -1,3 +1,4 @@
+pub mod cleanable;
 pub mod core;
 pub mod scan;
 pub mod status;

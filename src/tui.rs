@@ -17,6 +17,7 @@ mod tests {
         Node {
             name: OsString::from(name),
             kind,
+            cleanable: false,
             apparent: 4096,
             allocated: 2048,
             children,
@@ -88,7 +89,8 @@ mod tests {
     fn test_backend_renders_header_and_child_list() {
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let root = sample_tree();
+        let mut root = sample_tree();
+        root.children[0].cleanable = true;
         let app = App::new(
             PathBuf::from("/tmp/example"),
             root,
@@ -114,6 +116,7 @@ mod tests {
         assert!(rendered.contains("/tmp/example"));
         assert!(rendered.contains("Allocated"));
         assert!(rendered.contains("first"));
+        assert!(rendered.contains("d* first"));
         assert!(rendered.contains("[##########] 100%"));
     }
 
@@ -191,6 +194,7 @@ mod tests {
         root.children.push(Node {
             name: OsString::from("mounted"),
             kind: EntryKind::Directory,
+            cleanable: false,
             apparent: 0,
             allocated: 0,
             children: Vec::new(),
@@ -722,6 +726,7 @@ fn kind_marker(node: &Node) -> &'static str {
         return "×";
     }
     match node.kind {
+        EntryKind::Directory if node.cleanable => "d*",
         EntryKind::Directory => "d",
         EntryKind::File => "f",
         EntryKind::Symlink => "l",
@@ -878,7 +883,11 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         })
         .collect::<Vec<_>>();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Entries"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Entries (d* regenerable hint)"),
+        )
         .highlight_symbol("> ")
         .highlight_style(
             Style::default()
@@ -914,6 +923,7 @@ pub fn run(
         Node {
             name: path.as_os_str().to_owned(),
             kind: EntryKind::Directory,
+            cleanable: false,
             apparent: 0,
             allocated: 0,
             children: Vec::new(),

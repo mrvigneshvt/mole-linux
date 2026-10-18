@@ -19,12 +19,13 @@ The owner asked whether [tw93/Mole](https://github.com/tw93/Mole/) supports this
 - Use red-first tests for implementation. Do not claim build/test success until run with a Rust toolchain.
 - Do not add dependencies without approval. Do not commit automatically.
 
-## Immediate next steps
+## Immediate next steps (updated 2026-10-19, after M1)
 
-1. Install or otherwise make a Rust toolchain available, then compile the scaffold.
-2. Decide whether the first milestone is read-only disk analysis, cleanup candidate discovery, or another narrow workflow.
-3. Define supported paths, privilege behavior, dry-run output, and distribution support before writing removal code.
+1. M1 analyzer TUI is implemented and committed — see [plans/M1-analyzer.md](plans/M1-analyzer.md), [STATUS.md](STATUS.md), [KNOWN-GAPS.md](KNOWN-GAPS.md).
+2. Proposed M1.1: progressive results (paint children immediately, sizes stream in) + bounded parallel scan; benchmark vs `du` (release build). Needs a plan file before dispatch.
+3. Add GPL-3.0 LICENSE text; choose a non-Mole name before public release.
+4. Working model: this repo is orchestrated from a Claude session (CTO/QA/reviewer) dispatching Codex `gpt-6-luna` medium workers via Superset (`superset agents create --agent codex --model gpt-6-luna --effort medium`). Orchestrator reruns checks and drives the live TUI in tmux before accepting. Fast tier needs `service_tier="priority"`, not passable via Superset CLI.
 
 ## Current verification limits
 
-`cargo` was absent from PATH on 2026-10-19; no compile or tests were run. Host OS facts and GitHub CLI authentication were checked in the setup session. Recheck them before relying on them later.
+Rust 1.99.1 via rustup/mise is installed (2026-10-19); M1 suite green — see STATUS.md. Host OS facts and GitHub CLI authentication were checked in the setup session. Recheck them before relying on them later.

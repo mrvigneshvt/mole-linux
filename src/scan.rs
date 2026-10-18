@@ -18,6 +18,7 @@ pub enum EntryKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeStatus {
+    Scanning,
     Complete,
     Partial,
     Unavailable(String),
@@ -27,6 +28,8 @@ pub enum NodeStatus {
 #[derive(Debug, Clone)]
 pub struct Node {
     pub name: OsString,
+    /// Explicit target used by overview rows whose display name differs from their path.
+    pub target_path: Option<std::path::PathBuf>,
     pub kind: EntryKind,
     pub cleanable: bool,
     pub apparent: u64,
@@ -38,6 +41,192 @@ pub struct Node {
 #[derive(Debug)]
 pub struct ScanReport {
     pub root: Node,
+}
+
+#[derive(Clone, Debug)]
+pub struct OverviewRoots {
+    pub home: std::path::PathBuf,
+    pub cache: std::path::PathBuf,
+    pub data: std::path::PathBuf,
+    pub state: std::path::PathBuf,
+    pub trash: std::path::PathBuf,
+    pub pacman_cache: std::path::PathBuf,
+    pub journal: std::path::PathBuf,
+    pub docker: std::path::PathBuf,
+}
+
+impl OverviewRoots {
+    pub fn from_env() -> Option<Self> {
+        let xdg = crate::core::paths::XdgPaths::from_env()?;
+        Some(Self {
+            home: xdg.home,
+            cache: xdg.cache.clone(),
+            data: xdg.data.clone(),
+            state: xdg.state,
+            trash: xdg.data.join("Trash/files"),
+            pacman_cache: "/var/cache/pacman/pkg".into(),
+            journal: "/var/log/journal".into(),
+            docker: "/var/lib/docker".into(),
+        })
+    }
+
+    fn labeled(&self) -> [(&'static str, &std::path::Path); 8] {
+        [
+            ("Home", &self.home),
+            ("XDG cache", &self.cache),
+            ("XDG data", &self.data),
+            ("XDG state", &self.state),
+            ("Trash", &self.trash),
+            ("Pacman package cache", &self.pacman_cache),
+            ("Journal", &self.journal),
+            ("Docker", &self.docker),
+        ]
+    }
+}
+
+const MAX_CONCURRENT_OVERVIEW_ROOTS: usize = 4;
+
+/// Scans the Linux overview roots independently and retains unavailable roots as rows.
+// Ported from tw93/Mole cmd/analyze/main.go:createOverviewEntries (GPL-3.0)
+pub fn scan_overview(roots: &OverviewRoots, cancel: &AtomicBool) -> ScanReport {
+    let children = roots
+        .labeled()
+        .into_iter()
+        .map(|(label, path)| {
+            let mut node = scan(path, cancel).root;
+            node.name = label.into();
+            node.target_path = Some(path.to_path_buf());
+            node
+        })
+        .collect::<Vec<_>>();
+    let status = if children
+        .iter()
+        .any(|node| !matches!(node.status, NodeStatus::Complete))
+    {
+        NodeStatus::Partial
+    } else {
+        NodeStatus::Complete
+    };
+    let apparent = children
+        .iter()
+        .fold(0_u64, |sum, node| sum.saturating_add(node.apparent));
+    let allocated = children
+        .iter()
+        .fold(0_u64, |sum, node| sum.saturating_add(node.allocated));
+    ScanReport {
+        root: Node {
+            name: "/".into(),
+            target_path: None,
+            kind: EntryKind::Directory,
+            cleanable: false,
+            apparent,
+            allocated,
+            children,
+            status,
+        },
+    }
+}
+
+/// Publishes overview rows immediately, then measures independent roots with a fixed worker cap.
+pub fn scan_overview_progressive(
+    roots: &OverviewRoots,
+    cancel: &AtomicBool,
+    events: Sender<ScanEvent>,
+) {
+    let labeled = roots.labeled();
+    let mut root = Node {
+        name: "/".into(),
+        target_path: None,
+        kind: EntryKind::Directory,
+        cleanable: false,
+        apparent: 0,
+        allocated: 0,
+        children: labeled
+            .iter()
+            .map(|(label, path)| Node {
+                name: (*label).into(),
+                target_path: Some(path.to_path_buf()),
+                kind: EntryKind::Directory,
+                cleanable: false,
+                apparent: 0,
+                allocated: 0,
+                children: Vec::new(),
+                status: NodeStatus::Scanning,
+            })
+            .collect(),
+        status: NodeStatus::Scanning,
+    };
+    if !publish_event(&events, cancel, ScanEvent::Initial(root.clone())) {
+        return;
+    }
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (updates_tx, updates_rx) = std::sync::mpsc::channel();
+    let worker_count = labeled.len().min(MAX_CONCURRENT_OVERVIEW_ROOTS);
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let labeled = &labeled;
+            let updates_tx = updates_tx.clone();
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((label, path)) = labeled.get(index) else {
+                        break;
+                    };
+                    let mut node = scan(path, cancel).root;
+                    node.name = (*label).into();
+                    node.target_path = Some(path.to_path_buf());
+                    if updates_tx.send(node).is_err() {
+                        cancel.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            });
+        }
+        drop(updates_tx);
+        for updated in updates_rx {
+            let Some(row) = root
+                .children
+                .iter_mut()
+                .find(|row| row.name == updated.name)
+            else {
+                continue;
+            };
+            *row = updated;
+            let updated = row.clone();
+            root.apparent = root
+                .children
+                .iter()
+                .fold(0_u64, |sum, child| sum.saturating_add(child.apparent));
+            root.allocated = root
+                .children
+                .iter()
+                .fold(0_u64, |sum, child| sum.saturating_add(child.allocated));
+            if !publish_event(&events, cancel, ScanEvent::ChildUpdated(updated)) {
+                break;
+            }
+        }
+    });
+
+    if cancel.load(Ordering::Relaxed)
+        || root
+            .children
+            .iter()
+            .any(|row| !matches!(row.status, NodeStatus::Complete))
+    {
+        root.status = NodeStatus::Partial;
+    } else {
+        root.status = NodeStatus::Complete;
+    }
+    publish_event(&events, cancel, ScanEvent::Complete(ScanReport { root }));
+}
+
+pub fn overview_json(report: &ScanReport) -> Result<String, serde_json::Error> {
+    report_json_inner(report, Path::new("/"), true)
 }
 
 #[derive(Serialize)]
@@ -85,6 +274,14 @@ struct JsonFileEntry {
 /// Serializes the same scan tree used by the interactive analyzer.
 // Ported from tw93/Mole cmd/analyze/json.go:jsonEntriesFromDirEntries (GPL-3.0)
 pub fn report_json(report: &ScanReport, path: &Path) -> Result<String, serde_json::Error> {
+    report_json_inner(report, path, false)
+}
+
+fn report_json_inner(
+    report: &ScanReport,
+    path: &Path,
+    overview: bool,
+) -> Result<String, serde_json::Error> {
     let mut files = Vec::new();
     collect_files(&report.root, path, &mut files);
     files.sort_by(|left, right| {
@@ -98,12 +295,19 @@ pub fn report_json(report: &ScanReport, path: &Path) -> Result<String, serde_jso
     let output = JsonOutput {
         scan_status: status_name(&report.root.status),
         path: path.to_string_lossy().into_owned(),
-        overview: false,
+        overview,
         entries: report
             .root
             .children
             .iter()
-            .map(|node| json_entry(node, &path.join(&node.name)))
+            .map(|node| {
+                json_entry(
+                    node,
+                    node.target_path
+                        .as_deref()
+                        .unwrap_or(&path.join(&node.name)),
+                )
+            })
             .collect(),
         large_files: files,
         apparent_bytes: report.root.apparent,
@@ -144,7 +348,10 @@ fn json_entry(node: &Node, path: &Path) -> JsonEntry {
 
 fn collect_files(node: &Node, path: &Path, files: &mut Vec<JsonFileEntry>) {
     for child in &node.children {
-        let child_path = path.join(&child.name);
+        let child_path = child
+            .target_path
+            .clone()
+            .unwrap_or_else(|| path.join(&child.name));
         if child.kind == EntryKind::File {
             files.push(JsonFileEntry {
                 name: child.name.to_string_lossy().into_owned(),
@@ -170,6 +377,7 @@ fn count_files(node: &Node) -> u64 {
 
 fn status_name(status: &NodeStatus) -> &'static str {
     match status {
+        NodeStatus::Scanning => "scanning",
         NodeStatus::Complete => "complete",
         NodeStatus::Partial => "partial",
         NodeStatus::Unavailable(_) => "unavailable",
@@ -250,6 +458,7 @@ where
         if is_mount_boundary(root_dev, entry_dev) {
             let node = Node {
                 name,
+                target_path: None,
                 kind,
                 cleanable: false,
                 apparent: 0,
@@ -271,6 +480,7 @@ where
         };
         let node = Node {
             name,
+            target_path: None,
             kind,
             cleanable: kind == EntryKind::Directory
                 && crate::cleanable::is_cleanable_dir(&entry_path),
@@ -404,6 +614,7 @@ pub fn scan_progressive(path: &Path, cancel: &AtomicBool, events: Sender<ScanEve
     let root_dev = root_metadata.dev();
     let mut root = Node {
         name,
+        target_path: None,
         kind: EntryKind::Directory,
         cleanable: crate::cleanable::is_cleanable_dir(path),
         apparent: root_metadata.len(),
@@ -446,6 +657,7 @@ pub fn scan_progressive(path: &Path, cancel: &AtomicBool, events: Sender<ScanEve
                 if is_mount_boundary(root_dev, metadata.dev()) {
                     root.children.push(Node {
                         name: child_name,
+                        target_path: None,
                         kind,
                         cleanable: false,
                         apparent: 0,
@@ -462,6 +674,7 @@ pub fn scan_progressive(path: &Path, cancel: &AtomicBool, events: Sender<ScanEve
                             .unwrap_or(true);
                     let node = Node {
                         name: child_name,
+                        target_path: None,
                         kind,
                         cleanable: kind == EntryKind::Directory
                             && crate::cleanable::is_cleanable_dir(&child_path),
@@ -603,6 +816,7 @@ fn insert_tree_entry(node: Node, parent: Option<usize>, tree: &mut Vec<TreeEntry
 fn unavailable_node(name: OsString, reason: String) -> Node {
     Node {
         name,
+        target_path: None,
         kind: EntryKind::Other,
         cleanable: false,
         apparent: 0,

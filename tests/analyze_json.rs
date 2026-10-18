@@ -45,12 +45,14 @@ fn analyze_json_emits_scan_model_and_preserves_non_utf8_names() {
 fn analyze_json_keeps_partial_and_unavailable_states() {
     let root = Node {
         name: "root".into(),
+        target_path: None,
         kind: EntryKind::Directory,
         cleanable: false,
         apparent: 9,
         allocated: 9,
         children: vec![Node {
             name: "locked".into(),
+            target_path: None,
             kind: EntryKind::Directory,
             cleanable: false,
             apparent: 0,
@@ -73,6 +75,7 @@ fn analyze_json_keeps_partial_and_unavailable_states() {
 fn analyze_json_reports_apparent_and_allocated_bytes_and_excluded_mounts() {
     let root = Node {
         name: "root".into(),
+        target_path: None,
         kind: EntryKind::Directory,
         cleanable: false,
         apparent: 4200,
@@ -80,6 +83,7 @@ fn analyze_json_reports_apparent_and_allocated_bytes_and_excluded_mounts() {
         children: vec![
             Node {
                 name: "payload.bin".into(),
+                target_path: None,
                 kind: EntryKind::File,
                 cleanable: false,
                 apparent: 100,
@@ -89,6 +93,7 @@ fn analyze_json_reports_apparent_and_allocated_bytes_and_excluded_mounts() {
             },
             Node {
                 name: "mounted".into(),
+                target_path: None,
                 kind: EntryKind::Directory,
                 cleanable: false,
                 apparent: 0,

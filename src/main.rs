@@ -167,17 +167,31 @@ fn run() -> io::Result<()> {
     match command {
         Command::Analyze(args) => {
             if args.json {
-                let path = args.path.unwrap_or_else(|| PathBuf::from("."));
                 let cancel = AtomicBool::new(false);
-                let report = scan::scan(&path, &cancel);
-                let json = scan::report_json(&report, &path)
-                    .map_err(|error| io::Error::other(format!("failed to encode JSON: {error}")))?;
+                let json = if let Some(path) = args.path {
+                    let report = scan::scan(&path, &cancel);
+                    scan::report_json(&report, &path)
+                } else {
+                    let roots = scan::OverviewRoots::from_env().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "HOME is not set or invalid")
+                    })?;
+                    let report = scan::scan_overview(&roots, &cancel);
+                    scan::overview_json(&report)
+                }
+                .map_err(|error| io::Error::other(format!("failed to encode JSON: {error}")))?;
                 let mut stdout = io::stdout().lock();
-                writeln!(stdout, "{json}")?;
+                if let Err(error) = writeln!(stdout, "{json}") {
+                    if error.kind() == io::ErrorKind::BrokenPipe {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
                 return Ok(());
             }
-            let path = args.path.unwrap_or_else(|| PathBuf::from("."));
-            run_analyzer(path)
+            match args.path {
+                Some(path) => run_analyzer(path),
+                None => run_overview(),
+            }
         }
         Command::Status(args) => mole_linux::commands::status::run(args),
         Command::Clean(_) => not_implemented("clean", 16),
@@ -394,6 +408,28 @@ fn run_analyzer(path: PathBuf) -> io::Result<()> {
     let worker_result = worker
         .join()
         .map_err(|_| io::Error::other("scanner worker panicked"))?;
+    tui_result?;
+    worker_result
+}
+
+fn run_overview() -> io::Result<()> {
+    let roots = scan::OverviewRoots::from_env()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set or invalid"))?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let (report_tx, report_rx) = mpsc::channel();
+    let worker = thread::Builder::new()
+        .name("mole-overview".to_owned())
+        .spawn(move || {
+            scan::scan_overview_progressive(&roots, &worker_cancel, report_tx);
+            Ok(())
+        })?;
+    let root_path = PathBuf::from("/");
+    let tui_result = tui::run(&root_path, report_rx, Arc::clone(&cancel));
+    cancel.store(true, Ordering::Relaxed);
+    let worker_result = worker
+        .join()
+        .map_err(|_| io::Error::other("overview worker panicked"))?;
     tui_result?;
     worker_result
 }

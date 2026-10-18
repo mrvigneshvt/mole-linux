@@ -7,6 +7,7 @@ use mole_linux::tui::{LargeFiles, LargeFilesView};
 fn file(name: &str, size: u64) -> Node {
     Node {
         name: OsString::from(name),
+        target_path: None,
         kind: EntryKind::File,
         cleanable: false,
         apparent: size,
@@ -20,6 +21,7 @@ fn file(name: &str, size: u64) -> Node {
 fn large_files_view_keeps_top_twenty_and_unknown_files_unselectable() {
     let mut root = Node {
         name: OsString::from("root"),
+        target_path: None,
         kind: EntryKind::Directory,
         cleanable: false,
         apparent: 0,
@@ -31,6 +33,7 @@ fn large_files_view_keeps_top_twenty_and_unknown_files_unselectable() {
     };
     root.children.push(Node {
         name: OsString::from("unknown"),
+        target_path: None,
         kind: EntryKind::File,
         cleanable: false,
         apparent: 0,

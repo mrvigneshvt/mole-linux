@@ -16,6 +16,7 @@ mod tests {
     fn node(name: &str, kind: EntryKind, children: Vec<Node>) -> Node {
         Node {
             name: OsString::from(name),
+            target_path: None,
             kind,
             cleanable: false,
             apparent: 4096,
@@ -193,6 +194,7 @@ mod tests {
         let mut root = sample_tree();
         root.children.push(Node {
             name: OsString::from("mounted"),
+            target_path: None,
             kind: EntryKind::Directory,
             cleanable: false,
             apparent: 0,
@@ -351,7 +353,10 @@ fn collect_large_files(node: &Node, path: &Path, heap: &mut BinaryHeap<Reverse<(
     let mut pending = vec![(node, path.to_owned())];
     while let Some((parent, parent_path)) = pending.pop() {
         for child in &parent.children {
-            let child_path = parent_path.join(&child.name);
+            let child_path = child
+                .target_path
+                .clone()
+                .unwrap_or_else(|| parent_path.join(&child.name));
             if child.kind == EntryKind::File
                 && !matches!(
                     child.status,
@@ -583,6 +588,9 @@ impl Navigator {
                 break;
             };
             path.push(&child.name);
+            if let Some(target_path) = &child.target_path {
+                path = target_path.clone();
+            }
             node = child;
         }
         path
@@ -923,6 +931,7 @@ pub fn run(
         path.to_owned(),
         Node {
             name: path.as_os_str().to_owned(),
+            target_path: None,
             kind: EntryKind::Directory,
             cleanable: false,
             apparent: 0,

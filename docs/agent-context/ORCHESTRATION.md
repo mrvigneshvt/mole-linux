@@ -8,7 +8,7 @@ Gate before merge: rerun fmt/clippy/test in the worker worktree, review diff (ho
 |---|---|---|---|---|
 | #2 | M0.1 honeypot | – | 014bc3e5 | running |
 | #3 | M0.2 clap CLI | – | e9ba1191 | running |
-| #4 | M2.1 progressive scan | – | 2c9cb481 | running |
+| #4 | M2.1 progressive scan | – | 2c9cb481 | merged #46 |
 | #5–#44 | see issues | | | pending |
 
 Resume: `gh issue list --label parity --state open`; for running rows run `scripts/orchestrator/read.sh <ws>`.

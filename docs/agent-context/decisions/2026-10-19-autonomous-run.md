@@ -4,7 +4,7 @@ Owner approved [plans/PARITY-ROADMAP.md](../plans/PARITY-ROADMAP.md) and asked f
 
 | Topic | Decision |
 |---|---|
-| Implementers | **Only** Codex `gpt-6-luna`, effort `medium`, via Superset (`--agent codex --model gpt-6-luna --effort medium`). Claude session = orchestrator/QA only. |
+| Implementers | Codex `gpt-6-luna`, effort `medium`, via Superset. **Fallback when Codex usage is exhausted:** Claude `claude-haiku-5-5` (`--agent claude --model claude-haiku-5-5`). Claude Opus session = orchestrator/QA only. |
 | Tracking | One GitHub issue per roadmap unit on `mrvigneshvt/mole-linux`; milestone labels. |
 | Merging | Orchestrator may squash-merge PRs to `main` after its own gate passes (rerun suite + live honeypot run). One PR per issue. |
 | Pre-approved deps | serde, serde_json, clap, clap_complete, tempfile (dev), glob/globset, plus earlier ratatui, crossterm, rustix. Anything else → worker BLOCKS. |

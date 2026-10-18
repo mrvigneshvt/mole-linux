@@ -8,7 +8,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rustix::fs::{self as rfs, AtFlags, Mode as FileMode, OFlags, RenameFlags};
+use rustix::fs::{self as rfs, AtFlags, Mode as FileMode, OFlags, RenameFlags, StatxFlags};
 
 use super::paths::XdgPaths;
 use super::validate::{ValidationError, validate_path_for_deletion};
@@ -27,6 +27,7 @@ pub struct Identity {
     file_type: u32,
     mtime: i64,
     mtime_nsec: u64,
+    mount_id: Option<u64>,
 }
 
 impl Identity {
@@ -40,6 +41,7 @@ impl Identity {
             mtime_nsec: u64::try_from(metadata.mtime_nsec()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid nanosecond timestamp")
             })?,
+            mount_id: mount_id_at(rfs::CWD, path, AtFlags::SYMLINK_NOFOLLOW)?,
         })
     }
 
@@ -54,6 +56,7 @@ pub enum DeleteError {
     IdentityChanged,
     Cancelled,
     Partial(io::Error),
+    MountIdUnavailable,
     CrossFilesystemTrash,
     TrashMetadataCleanup(io::Error),
     Io(io::Error),
@@ -66,6 +69,9 @@ impl std::fmt::Display for DeleteError {
             Self::IdentityChanged => f.write_str("target identity changed after preview; skipped"),
             Self::Cancelled => f.write_str("batch cancelled before this item"),
             Self::Partial(error) => write!(f, "partial permanent removal: {error}"),
+            Self::MountIdUnavailable => {
+                f.write_str("mount ID unavailable; refusing permanent directory removal")
+            }
             Self::CrossFilesystemTrash => {
                 f.write_str("Trash is on another filesystem; refusing Trash move")
             }
@@ -118,11 +124,13 @@ pub fn delete(
     // relative to it immediately before renameat2/unlinkat.
     let current =
         rfs::statat(&parent_fd, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+    let current_mount_id = mount_id_at(&parent_fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
     if current.st_dev != expected.device
         || current.st_ino != expected.inode
         || current.st_mode & 0o170000 != expected.file_type
         || current.st_mtime != expected.mtime
         || current.st_mtime_nsec != expected.mtime_nsec
+        || current_mount_id != expected.mount_id
     {
         return Err(DeleteError::IdentityChanged);
     }
@@ -132,6 +140,7 @@ pub fn delete(
         DeleteMode::Trash => move_to_trash(path, name, &parent_fd, home, expected),
         DeleteMode::Permanent => {
             if current.st_mode & 0o170000 == 0o040000 {
+                let root_mount_id = require_mount_id(expected.mount_id)?;
                 let target_fd = rfs::openat(
                     &parent_fd,
                     name,
@@ -140,10 +149,14 @@ pub fn delete(
                 )
                 .map_err(io::Error::from)?;
                 let opened = rfs::fstat(&target_fd).map_err(io::Error::from)?;
-                if opened.st_dev != expected.device || opened.st_ino != expected.inode {
+                let opened_mount_id = mount_id_at(&target_fd, ".", AtFlags::empty())?;
+                if opened.st_dev != expected.device
+                    || opened.st_ino != expected.inode
+                    || opened_mount_id != Some(root_mount_id)
+                {
                     return Err(DeleteError::IdentityChanged);
                 }
-                remove_tree(&target_fd, expected.device)
+                remove_tree(&target_fd, expected.device, root_mount_id)
                     .map_err(|error| DeleteError::Partial(io::Error::other(error.to_string())))?;
                 let rebound = rfs::statat(&parent_fd, name, AtFlags::SYMLINK_NOFOLLOW)
                     .map_err(io::Error::from)?;
@@ -162,7 +175,7 @@ pub fn delete(
     }
 }
 
-fn remove_tree(directory: &OwnedFd, device: u64) -> Result<(), DeleteError> {
+fn remove_tree(directory: &OwnedFd, device: u64, mount_id: u64) -> Result<(), DeleteError> {
     let entries = fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))?;
     for entry in entries {
         let entry = entry?;
@@ -172,9 +185,16 @@ fn remove_tree(directory: &OwnedFd, device: u64) -> Result<(), DeleteError> {
         }
         let stat =
             rfs::statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+        let entry_mount_id = mount_id_at(directory, &name, AtFlags::SYMLINK_NOFOLLOW)?;
         if stat.st_dev != device {
             return Err(DeleteError::Io(io::Error::other(
                 "permanent removal refuses to cross a filesystem boundary",
+            )));
+        }
+        let entry_mount_id = require_mount_id(entry_mount_id)?;
+        if !mount_boundary_decision(device, Some(mount_id), stat.st_dev, Some(entry_mount_id)) {
+            return Err(DeleteError::Io(io::Error::other(
+                "permanent removal refuses to cross a mount boundary",
             )));
         }
         if stat.st_mode & 0o170000 == 0o040000 {
@@ -186,10 +206,14 @@ fn remove_tree(directory: &OwnedFd, device: u64) -> Result<(), DeleteError> {
             )
             .map_err(io::Error::from)?;
             let opened = rfs::fstat(&child).map_err(io::Error::from)?;
-            if opened.st_dev != stat.st_dev || opened.st_ino != stat.st_ino {
+            let opened_mount_id = mount_id_at(&child, ".", AtFlags::empty())?;
+            if opened.st_dev != stat.st_dev
+                || opened.st_ino != stat.st_ino
+                || opened_mount_id != Some(entry_mount_id)
+            {
                 return Err(DeleteError::IdentityChanged);
             }
-            remove_tree(&child, device)?;
+            remove_tree(&child, device, mount_id)?;
             let rebound = rfs::statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(io::Error::from)?;
             if rebound.st_dev != stat.st_dev || rebound.st_ino != stat.st_ino {
@@ -374,7 +398,11 @@ fn move_to_trash(
             Ok(()) => return Ok(trash.join("files").join(candidate)),
             Err(error) => {
                 let is_collision = error.raw_os_error() == rustix::io::Errno::EXIST.raw_os_error();
-                let error = cleanup_trash_info(&info_fd, &info_name, DeleteError::Io(error.into()));
+                let mapped_error = trash_rename_error(error);
+                if matches!(mapped_error, DeleteError::CrossFilesystemTrash) {
+                    return Err(cleanup_trash_info(&info_fd, &info_name, mapped_error));
+                }
+                let error = cleanup_trash_info(&info_fd, &info_name, mapped_error);
                 if matches!(error, DeleteError::TrashMetadataCleanup(_)) {
                     return Err(error);
                 }
@@ -424,6 +452,41 @@ fn ensure_child_dir(parent: &OwnedFd, name: &str) -> io::Result<OwnedFd> {
         ));
     }
     Ok(directory)
+}
+
+fn mount_id_at<Fd: rustix::fd::AsFd, P: rustix::path::Arg>(
+    dirfd: Fd,
+    path: P,
+    flags: AtFlags,
+) -> io::Result<Option<u64>> {
+    match rfs::statx(
+        dirfd,
+        path,
+        flags,
+        StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+    ) {
+        Ok(stat) if stat.stx_mask & StatxFlags::MNT_ID.bits() != 0 => Ok(Some(stat.stx_mnt_id)),
+        Ok(_) => Ok(None),
+        Err(error) if error == rustix::io::Errno::NOSYS || error == rustix::io::Errno::INVAL => {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn mount_boundary_decision(
+    selected_device: u64,
+    selected_mount_id: Option<u64>,
+    entry_device: u64,
+    entry_mount_id: Option<u64>,
+) -> bool {
+    selected_device == entry_device
+        && selected_mount_id.is_some()
+        && selected_mount_id == entry_mount_id
+}
+
+fn require_mount_id(mount_id: Option<u64>) -> Result<u64, DeleteError> {
+    mount_id.ok_or(DeleteError::MountIdUnavailable)
 }
 
 fn filesystem_topdir(path: &Path, device: u64) -> Result<PathBuf, DeleteError> {
@@ -477,4 +540,72 @@ fn utc_timestamp(seconds: u64) -> String {
         day_seconds % 3_600 / 60,
         day_seconds % 60
     )
+}
+
+fn trash_rename_error(error: rustix::io::Errno) -> DeleteError {
+    if error == rustix::io::Errno::XDEV {
+        DeleteError::CrossFilesystemTrash
+    } else {
+        DeleteError::Io(error.into())
+    }
+}
+
+#[cfg(test)]
+mod mount_boundary_tests {
+    use super::{
+        DeleteError, mount_boundary_decision, open_dir, require_mount_id, trash_rename_error,
+    };
+
+    #[test]
+    fn same_mount_requires_matching_device_and_present_mount_ids() {
+        assert!(mount_boundary_decision(7, Some(12), 7, Some(12)));
+        assert!(!mount_boundary_decision(7, Some(12), 7, Some(13)));
+        assert!(!mount_boundary_decision(7, None, 7, Some(12)));
+        assert!(!mount_boundary_decision(7, Some(12), 7, None));
+        assert!(!mount_boundary_decision(7, None, 7, None));
+        assert!(!mount_boundary_decision(7, Some(12), 8, Some(12)));
+    }
+
+    #[test]
+    fn unavailable_mount_id_is_not_accepted_for_permanent_directory_removal() {
+        assert!(matches!(
+            require_mount_id(None),
+            Err(DeleteError::MountIdUnavailable)
+        ));
+        assert_eq!(require_mount_id(Some(12)).expect("present ID"), 12);
+    }
+
+    #[test]
+    fn cross_device_rename_error_is_reported_as_refused_trash() {
+        let error = trash_rename_error(rustix::io::Errno::XDEV);
+        assert!(matches!(error, super::DeleteError::CrossFilesystemTrash));
+        assert!(error.to_string().contains("another filesystem"));
+    }
+
+    #[test]
+    fn renameat2_across_mounts_returns_exdev() {
+        let source = tempfile::tempdir_in("/tmp").expect("source tempdir");
+        let destination = tempfile::tempdir_in("/dev/shm").expect("destination tempdir");
+        std::fs::write(source.path().join("item"), "payload").expect("source item");
+        let source_fd = open_dir(source.path()).expect("source dir fd");
+        let destination_fd = open_dir(destination.path()).expect("destination dir fd");
+
+        let error = rustix::fs::renameat_with(
+            &source_fd,
+            "item",
+            &destination_fd,
+            "item",
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .expect_err("rename across mounts must fail");
+        assert_eq!(error, rustix::io::Errno::XDEV);
+        assert!(matches!(
+            trash_rename_error(error),
+            DeleteError::CrossFilesystemTrash
+        ));
+        assert_eq!(
+            std::fs::read(source.path().join("item")).expect("source remains"),
+            b"payload"
+        );
+    }
 }

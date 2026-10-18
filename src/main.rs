@@ -179,10 +179,14 @@ fn run() -> io::Result<()> {
     match command {
         Command::Analyze(args) => {
             if args.json {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "JSON output is not implemented yet (#7)",
-                ));
+                let path = args.path.unwrap_or_else(|| PathBuf::from("."));
+                let cancel = AtomicBool::new(false);
+                let report = scan::scan(&path, &cancel);
+                let json = scan::report_json(&report, &path)
+                    .map_err(|error| io::Error::other(format!("failed to encode JSON: {error}")))?;
+                let mut stdout = io::stdout().lock();
+                writeln!(stdout, "{json}")?;
+                return Ok(());
             }
             let path = args.path.unwrap_or_else(|| PathBuf::from("."));
             run_analyzer(path)

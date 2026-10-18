@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc::Sender};
 
+use serde::Serialize;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
     Directory,
@@ -35,6 +37,140 @@ pub struct Node {
 #[derive(Debug)]
 pub struct ScanReport {
     pub root: Node,
+}
+
+#[derive(Serialize)]
+struct JsonOutput {
+    scan_status: &'static str,
+    path: String,
+    overview: bool,
+    entries: Vec<JsonEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    large_files: Vec<JsonFileEntry>,
+    apparent_bytes: u64,
+    allocated_bytes: u64,
+    total_apparent_bytes: u64,
+    total_allocated_bytes: u64,
+    total_size: u64,
+    total_files: u64,
+}
+
+#[derive(Serialize)]
+struct JsonEntry {
+    scan_status: &'static str,
+    name: String,
+    name_bytes: Vec<u8>,
+    path: String,
+    /// Upstream-compatible `size` field; reports allocated bytes.
+    size: u64,
+    apparent_bytes: u64,
+    allocated_bytes: u64,
+    is_dir: bool,
+}
+
+#[derive(Serialize)]
+struct JsonFileEntry {
+    name: String,
+    name_bytes: Vec<u8>,
+    path: String,
+    /// Upstream-compatible `size` field; reports allocated bytes.
+    size: u64,
+    apparent_bytes: u64,
+    allocated_bytes: u64,
+}
+
+/// Serializes the same scan tree used by the interactive analyzer.
+// Ported from tw93/Mole cmd/analyze/json.go:jsonEntriesFromDirEntries (GPL-3.0)
+pub fn report_json(report: &ScanReport, path: &Path) -> Result<String, serde_json::Error> {
+    let mut files = Vec::new();
+    collect_files(&report.root, path, &mut files);
+    files.sort_by(|left, right| {
+        right
+            .size
+            .cmp(&left.size)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    files.truncate(20);
+    let total_files = count_files(&report.root);
+    let output = JsonOutput {
+        scan_status: status_name(&report.root.status),
+        path: path.to_string_lossy().into_owned(),
+        overview: false,
+        entries: report
+            .root
+            .children
+            .iter()
+            .map(|node| json_entry(node, &path.join(&node.name)))
+            .collect(),
+        large_files: files,
+        apparent_bytes: report.root.apparent,
+        allocated_bytes: report.root.allocated,
+        total_apparent_bytes: report
+            .root
+            .children
+            .iter()
+            .fold(0_u64, |total, child| total.saturating_add(child.apparent)),
+        total_allocated_bytes: report
+            .root
+            .children
+            .iter()
+            .fold(0_u64, |total, child| total.saturating_add(child.allocated)),
+        total_size: report
+            .root
+            .children
+            .iter()
+            .fold(0_u64, |total, child| total.saturating_add(child.allocated)),
+        total_files,
+    };
+    serde_json::to_string_pretty(&output)
+}
+
+fn json_entry(node: &Node, path: &Path) -> JsonEntry {
+    JsonEntry {
+        scan_status: status_name(&node.status),
+        name: node.name.to_string_lossy().into_owned(),
+        name_bytes: node.name.as_encoded_bytes().to_vec(),
+        path: path.to_string_lossy().into_owned(),
+        size: node.allocated,
+        apparent_bytes: node.apparent,
+        allocated_bytes: node.allocated,
+        is_dir: node.kind == EntryKind::Directory,
+    }
+}
+
+fn collect_files(node: &Node, path: &Path, files: &mut Vec<JsonFileEntry>) {
+    for child in &node.children {
+        let child_path = path.join(&child.name);
+        if child.kind == EntryKind::File {
+            files.push(JsonFileEntry {
+                name: child.name.to_string_lossy().into_owned(),
+                name_bytes: child.name.as_encoded_bytes().to_vec(),
+                path: child_path.to_string_lossy().into_owned(),
+                size: child.allocated,
+                apparent_bytes: child.apparent,
+                allocated_bytes: child.allocated,
+            });
+        } else {
+            collect_files(child, &child_path, files);
+        }
+    }
+}
+
+fn count_files(node: &Node) -> u64 {
+    node.children.iter().fold(0_u64, |total, child| {
+        total
+            .saturating_add(u64::from(child.kind == EntryKind::File))
+            .saturating_add(count_files(child))
+    })
+}
+
+fn status_name(status: &NodeStatus) -> &'static str {
+    match status {
+        NodeStatus::Complete => "complete",
+        NodeStatus::Partial => "partial",
+        NodeStatus::Unavailable(_) => "unavailable",
+        NodeStatus::Excluded(_) => "excluded",
+    }
 }
 
 #[derive(Debug)]

@@ -89,6 +89,7 @@ pub struct MountUsage {
     pub source: String,
     pub filesystem: String,
     pub mountpoint: String,
+    pub aliases: Vec<String>,
     pub total_bytes: Option<u64>,
     pub used_bytes: Option<u64>,
     pub available_bytes: Option<u64>,
@@ -195,6 +196,7 @@ pub struct Battery {
 #[derive(Debug, Serialize)]
 pub struct Thermal {
     pub name: String,
+    pub sensor_type: Option<String>,
     pub millicelsius: Option<i64>,
 }
 
@@ -431,6 +433,7 @@ fn collect_disks(proc_root: &Path) -> Disks {
                     source: decode_mount_field(right[1]),
                     filesystem: filesystem.to_owned(),
                     mountpoint: escape_controls(&mountpoint),
+                    aliases: Vec::new(),
                     total_bytes: total,
                     used_bytes: used,
                     available_bytes: avail,
@@ -439,6 +442,23 @@ fn collect_disks(proc_root: &Path) -> Disks {
             Err(_) => partial = true,
         }
     }
+    mounts.sort_by(|left, right| {
+        (&left.source, &left.filesystem)
+            .cmp(&(&right.source, &right.filesystem))
+            .then_with(|| left.mountpoint.len().cmp(&right.mountpoint.len()))
+            .then_with(|| left.mountpoint.cmp(&right.mountpoint))
+    });
+    let mut unique: Vec<MountUsage> = Vec::new();
+    for mount in mounts {
+        if let Some(primary) = unique.last_mut().filter(|primary| {
+            primary.source == mount.source && primary.filesystem == mount.filesystem
+        }) {
+            primary.aliases.push(mount.mountpoint);
+        } else {
+            unique.push(mount);
+        }
+    }
+    let mounts = unique;
     let availability = if mounts.is_empty() {
         Availability::Unavailable
     } else if partial {
@@ -527,6 +547,7 @@ fn scan_processes(root: &Path, stat_zombies: Option<usize>) -> Processes {
         };
         let raw = match fs::read_to_string(entry.path().join("stat")) {
             Ok(v) => v,
+            Err(error) if is_transient_proc_disappearance(&error) => continue,
             Err(_) => {
                 complete = false;
                 continue;
@@ -547,6 +568,9 @@ fn scan_processes(root: &Path, stat_zombies: Option<usize>) -> Processes {
         zombies: stat_zombies.or_else(|| complete.then_some(zombies)),
         top: found,
     }
+}
+fn is_transient_proc_disappearance(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
 }
 fn parse_process(pid: u32, raw: &str, root: &Path) -> Option<Process> {
     let open = raw.find('(')?;
@@ -620,16 +644,97 @@ fn collect_thermal(root: &Path) -> Vec<Thermal> {
             let Some(name) = e.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
+            if !name.starts_with("thermal_zone") {
+                continue;
+            }
+            let sensor_type = fs::read_to_string(d.join("type"))
+                .ok()
+                .map(|v| escape_controls(v.trim()));
             let temp = fs::read_to_string(d.join("temp"))
                 .ok()
                 .and_then(|v| v.trim().parse().ok());
             out.push(Thermal {
                 name,
+                sensor_type,
                 millicelsius: temp,
             });
         }
     }
     out
+}
+
+pub fn text_report(snapshot: &Snapshot) -> String {
+    let mut lines = vec![
+        "System status".to_owned(),
+        format!(
+            "CPU: {:?} ({} cores)",
+            snapshot.cpu.availability,
+            snapshot
+                .cpu
+                .logical_cores
+                .map_or_else(|| "unknown".to_owned(), |n| n.to_string())
+        ),
+        format!(
+            "Load: {} / {} / {}",
+            display(snapshot.load.one),
+            display(snapshot.load.five),
+            display(snapshot.load.fifteen)
+        ),
+        format!(
+            "Memory: {} / {}",
+            format_kib_gib(snapshot.memory.used_kb),
+            format_kib_gib(snapshot.memory.total_kb)
+        ),
+        format!(
+            "Swap: {} / {}",
+            format_kib_gib(snapshot.memory.swap_used_kb),
+            format_kib_gib(snapshot.memory.swap_total_kb)
+        ),
+    ];
+    if let Some(disk) = snapshot
+        .disks
+        .mounts
+        .iter()
+        .find(|disk| disk.mountpoint == "/")
+        .or_else(|| snapshot.disks.mounts.first())
+    {
+        lines.push(format!(
+            "Disk ({}): {} / {}",
+            disk.mountpoint,
+            format_bytes_gb(disk.used_bytes),
+            format_bytes_gb(disk.total_bytes)
+        ));
+    } else {
+        lines.push("Disk: unknown GB / unknown GB".to_owned());
+    }
+    lines.push(format!(
+        "Processes: {} zombies",
+        display(snapshot.processes.zombies)
+    ));
+    lines.join("\n") + "\n"
+}
+
+pub fn format_kib_gib(value: Option<u64>) -> String {
+    format_hundredths(value.map(u128::from), 1024 * 1024, "GiB")
+}
+
+pub fn format_bytes_gb(value: Option<u64>) -> String {
+    format_hundredths(value.map(u128::from), 1_000_000_000, "GB")
+}
+
+fn format_hundredths(value: Option<u128>, denominator: u128, unit: &str) -> String {
+    value.map_or_else(
+        || format!("unknown {unit}"),
+        |value| {
+            let hundredths =
+                value.saturating_mul(100).saturating_add(denominator / 2) / denominator;
+            format!("{}.{:02} {unit}", hundredths / 100, hundredths % 100)
+        },
+    )
+}
+
+fn display<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
 }
 
 #[cfg(test)]
@@ -640,6 +745,16 @@ mod tests {
         let m = parse_meminfo("MemTotal: broken kB\n");
         assert_eq!(m.total_kb, None);
         assert_eq!(m.used_kb, None);
+    }
+
+    #[test]
+    fn disappearing_proc_entries_do_not_make_zombie_count_unknown() {
+        assert!(is_transient_proc_disappearance(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!is_transient_proc_disappearance(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
     }
 
     #[test]

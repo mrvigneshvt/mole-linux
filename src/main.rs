@@ -398,47 +398,11 @@ fn print_snapshot(snapshot: &status::Snapshot, json: bool) -> io::Result<()> {
         serde_json::to_writer(io::stdout().lock(), &snapshot).map_err(io::Error::other)?;
         println!();
     } else {
-        let mut out = io::stdout().lock();
-        writeln!(out, "System status")?;
-        writeln!(
-            out,
-            "CPU: {:?} ({} cores)",
-            snapshot.cpu.availability,
-            snapshot
-                .cpu
-                .logical_cores
-                .map_or_else(|| "unknown".to_owned(), |n| n.to_string())
-        )?;
-        writeln!(
-            out,
-            "Load: {} / {} / {}",
-            display(snapshot.load.one),
-            display(snapshot.load.five),
-            display(snapshot.load.fifteen)
-        )?;
-        writeln!(
-            out,
-            "Memory: {} / {} kB",
-            display(snapshot.memory.used_kb),
-            display(snapshot.memory.total_kb)
-        )?;
-        writeln!(
-            out,
-            "Swap: {} / {} kB",
-            display(snapshot.memory.swap_used_kb),
-            display(snapshot.memory.swap_total_kb)
-        )?;
-        writeln!(
-            out,
-            "Processes: {} zombies",
-            display(snapshot.processes.zombies)
-        )?;
+        io::stdout()
+            .lock()
+            .write_all(status::text_report(snapshot).as_bytes())?;
     }
     Ok(())
-}
-
-fn display<T: std::fmt::Display>(value: Option<T>) -> String {
-    value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
 }
 
 fn not_implemented(command: &str, issue: u32) -> io::Result<()> {

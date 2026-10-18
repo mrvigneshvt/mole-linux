@@ -38,3 +38,4 @@ branding and potential upstream code reuse before release; see
 - 2026-10-19: Committed M1 analyzer (feat) on branch plan-linux-mole-tool-b4f9a8b8 with .gitignore. Not pushed. Next: M1.1 progressive scan plan.
 - 2026-10-19: Drafted full-parity closed-loop plan [plans/PARITY-ROADMAP.md](plans/PARITY-ROADMAP.md) + generated [plans/PARITY-LEDGER.md](plans/PARITY-LEDGER.md) (upstream entry functions + tests; dispositions proposed). Awaiting owner approval; nothing dispatched.
 - 2026-10-19: Owner approved roadmap + autonomous run ([decision](decisions/2026-10-19-autonomous-run.md)). Added root AGENTS.md for workers. Next: GitHub issues, honeypot, dispatch.
+- 2026-10-19: Issues #2–#44 created; wave 1 (#2,#3,#4) dispatched. Orchestrator scripts + live state: [ORCHESTRATION.md](ORCHESTRATION.md).

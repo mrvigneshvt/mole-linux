@@ -25,6 +25,9 @@ Linux-first Rust port of [tw93/Mole](https://github.com/tw93/Mole) (macOS cleane
 
 ## Workflow (TDD, red first)
 
+**Plan gate is pre-approved:** your GitHub issue *is* the approved plan (owner approved the roadmap; orchestrator owns scope). Never stop to ask for approval of an in-scope plan — proceed to completion. Only stop via `SUPERSET_WORKER_BLOCKED` for a real blocker (unapproved dep, out-of-scope need, safety conflict). The owner is asleep; nobody will answer questions.
+
+
 1. Branch is prepared for you; don't switch branches.
 2. Write the failing test(s) first — port the upstream test contract named in the issue. Run; confirm the failure is the missing behavior.
 3. Minimal implementation. Then:

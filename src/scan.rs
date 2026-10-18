@@ -4,6 +4,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc::Sender};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -36,6 +37,13 @@ pub struct ScanReport {
     pub root: Node,
 }
 
+#[derive(Debug)]
+pub enum ScanEvent {
+    Initial(Node),
+    ChildUpdated(Node),
+    Complete(ScanReport),
+}
+
 struct TreeEntry {
     node: Node,
     children: Vec<usize>,
@@ -50,9 +58,27 @@ pub fn scan_with_device_ids<F>(path: &Path, cancel: &AtomicBool, device_id: F) -
 where
     F: Fn(&Path, &fs::Metadata) -> u64,
 {
+    scan_with_shared_hardlinks(
+        path,
+        cancel,
+        device_id,
+        Arc::new(Mutex::new(HashSet::new())),
+        None,
+    )
+}
+
+fn scan_with_shared_hardlinks<F>(
+    path: &Path,
+    cancel: &AtomicBool,
+    device_id: F,
+    hardlinks: Arc<Mutex<HashSet<(u64, u64)>>>,
+    root_device: Option<u64>,
+) -> ScanReport
+where
+    F: Fn(&Path, &fs::Metadata) -> u64,
+{
     let mut tree = Vec::<TreeEntry>::new();
-    let mut pending = vec![(path.to_owned(), None::<usize>, None::<u64>)];
-    let mut hardlinks = HashSet::new();
+    let mut pending = vec![(path.to_owned(), None::<usize>, root_device)];
 
     while let Some((entry_path, parent, root_dev)) = pending.pop() {
         if cancel.load(Ordering::Relaxed) && parent.is_some() {
@@ -94,9 +120,14 @@ where
             continue;
         }
 
-        let duplicate_hardlink = kind == EntryKind::File
-            && metadata.nlink() > 1
-            && !hardlinks.insert((metadata.dev(), metadata.ino()));
+        let duplicate_hardlink = if kind == EntryKind::File && metadata.nlink() > 1 {
+            match hardlinks.lock() {
+                Ok(mut seen) => !seen.insert((metadata.dev(), metadata.ino())),
+                Err(_) => true,
+            }
+        } else {
+            false
+        };
         let node = Node {
             name,
             kind,
@@ -198,6 +229,216 @@ where
         None => unavailable_node(OsString::new(), "scan produced no root".to_owned()),
     };
     ScanReport { root }
+}
+
+/// Publishes the immediate root listing before scanning directories in a bounded worker pool.
+// Ported from tw93/Mole cmd/analyze/live_scan.go:readLiveScanInitialEntries (GPL-3.0)
+pub fn scan_progressive(path: &Path, cancel: &AtomicBool, events: Sender<ScanEvent>) {
+    let name = path
+        .file_name()
+        .map_or_else(|| path.as_os_str().to_owned(), OsString::from);
+    let root_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let root = unavailable_node(name, error.to_string());
+            if !publish_event(&events, cancel, ScanEvent::Initial(root.clone())) {
+                return;
+            }
+            publish_event(&events, cancel, ScanEvent::Complete(ScanReport { root }));
+            return;
+        }
+    };
+    if !root_metadata.is_dir() {
+        let mut root = scan(path, cancel).root;
+        root.name = name;
+        if !publish_event(&events, cancel, ScanEvent::Initial(root.clone())) {
+            return;
+        }
+        publish_event(&events, cancel, ScanEvent::Complete(ScanReport { root }));
+        return;
+    }
+
+    let root_dev = root_metadata.dev();
+    let mut root = Node {
+        name,
+        kind: EntryKind::Directory,
+        apparent: root_metadata.len(),
+        allocated: root_metadata.blocks().saturating_mul(512),
+        children: Vec::new(),
+        status: NodeStatus::Partial,
+    };
+    let mut targets = Vec::new();
+    let hardlinks = Arc::new(Mutex::new(HashSet::new()));
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            root.status = NodeStatus::Unavailable(error.to_string());
+            root.apparent = 0;
+            root.allocated = 0;
+            if !publish_event(&events, cancel, ScanEvent::Initial(root.clone())) {
+                return;
+            }
+            publish_event(&events, cancel, ScanEvent::Complete(ScanReport { root }));
+            return;
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(error) => root
+                .children
+                .push(unavailable_node(OsString::new(), error.to_string())),
+        }
+    }
+    paths.sort_by(|left: &PathBuf, right: &PathBuf| left.file_name().cmp(&right.file_name()));
+    for child_path in paths {
+        let child_name = child_path
+            .file_name()
+            .map_or_else(|| child_path.as_os_str().to_owned(), OsString::from);
+        match fs::symlink_metadata(&child_path) {
+            Ok(metadata) => {
+                let kind = entry_kind(&metadata);
+                if is_mount_boundary(root_dev, metadata.dev()) {
+                    root.children.push(Node {
+                        name: child_name,
+                        kind,
+                        apparent: 0,
+                        allocated: 0,
+                        children: Vec::new(),
+                        status: NodeStatus::Excluded("mount boundary".to_owned()),
+                    });
+                } else {
+                    let duplicate = kind == EntryKind::File
+                        && metadata.nlink() > 1
+                        && hardlinks
+                            .lock()
+                            .map(|mut seen| !seen.insert((metadata.dev(), metadata.ino())))
+                            .unwrap_or(true);
+                    let node = Node {
+                        name: child_name,
+                        kind,
+                        apparent: if duplicate { 0 } else { metadata.len() },
+                        allocated: if duplicate {
+                            0
+                        } else {
+                            metadata.blocks().saturating_mul(512)
+                        },
+                        children: Vec::new(),
+                        status: if kind == EntryKind::Directory {
+                            NodeStatus::Partial
+                        } else {
+                            NodeStatus::Complete
+                        },
+                    };
+                    if kind == EntryKind::Directory {
+                        targets.push(child_path);
+                    }
+                    root.apparent = root.apparent.saturating_add(node.apparent);
+                    root.allocated = root.allocated.saturating_add(node.allocated);
+                    root.children.push(node);
+                }
+            }
+            Err(error) => root
+                .children
+                .push(unavailable_node(child_name, error.to_string())),
+        }
+    }
+    sort_children(&mut root.children);
+    if !publish_event(&events, cancel, ScanEvent::Initial(root.clone())) {
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (updates_tx, updates_rx) = std::sync::mpsc::channel();
+    let worker_count = targets.len().clamp(1, 12);
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let targets = &targets;
+            let updates_tx = updates_tx.clone();
+            let hardlinks = Arc::clone(&hardlinks);
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(child_path) = targets.get(index) else {
+                        break;
+                    };
+                    let report = scan_with_shared_hardlinks(
+                        child_path,
+                        cancel,
+                        |_, metadata| metadata.dev(),
+                        Arc::clone(&hardlinks),
+                        Some(root_dev),
+                    );
+                    if updates_tx.send(report.root).is_err() {
+                        cancel.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            });
+        }
+        drop(updates_tx);
+        for updated in updates_rx {
+            let Some(current) = root
+                .children
+                .iter_mut()
+                .find(|child| child.name == updated.name)
+            else {
+                continue;
+            };
+            *current = updated;
+            if !publish_event(&events, cancel, ScanEvent::ChildUpdated(current.clone())) {
+                break;
+            }
+        }
+    });
+    root.apparent = root
+        .children
+        .iter()
+        .fold(root_metadata.len(), |sum, child| {
+            sum.saturating_add(child.apparent)
+        });
+    root.allocated = root
+        .children
+        .iter()
+        .fold(root_metadata.blocks().saturating_mul(512), |sum, child| {
+            sum.saturating_add(child.allocated)
+        });
+    if cancel.load(Ordering::Relaxed)
+        || root.children.iter().any(|child| {
+            matches!(
+                child.status,
+                NodeStatus::Partial | NodeStatus::Unavailable(_)
+            )
+        })
+    {
+        root.status = NodeStatus::Partial;
+    } else {
+        root.status = NodeStatus::Complete;
+    }
+    sort_children(&mut root.children);
+    publish_event(&events, cancel, ScanEvent::Complete(ScanReport { root }));
+}
+
+fn publish_event(events: &Sender<ScanEvent>, cancel: &AtomicBool, event: ScanEvent) -> bool {
+    if events.send(event).is_err() {
+        cancel.store(true, Ordering::Relaxed);
+        false
+    } else {
+        true
+    }
+}
+
+fn sort_children(children: &mut [Node]) {
+    children.sort_by(|left, right| {
+        right
+            .allocated
+            .cmp(&left.allocated)
+            .then_with(|| left.name.cmp(&right.name))
+    });
 }
 
 fn insert_tree_entry(node: Node, parent: Option<usize>, tree: &mut Vec<TreeEntry>) -> usize {

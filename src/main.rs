@@ -50,14 +50,11 @@ fn run() -> io::Result<()> {
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
     let worker_path = path.clone();
-    let (report_tx, report_rx) = mpsc::sync_channel(1);
+    let (report_tx, report_rx) = mpsc::channel();
     let worker = thread::Builder::new()
         .name("mole-scan".to_owned())
         .spawn(move || {
-            let report = scan::scan(&worker_path, &worker_cancel);
-            if report_tx.send(report).is_err() && !worker_cancel.load(Ordering::Relaxed) {
-                return Err(io::Error::other("TUI closed before scan completed"));
-            }
+            scan::scan_progressive(&worker_path, &worker_cancel, report_tx);
             Ok(())
         })?;
 

@@ -1,6 +1,7 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mole_linux::scan;
@@ -254,4 +255,106 @@ fn deep_tree_scan_completes_on_small_thread_stack() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn progressive_scan_publishes_immediate_children_before_sizes_and_completion() {
+    let dir = fixture();
+    fs::create_dir(dir.join("directory")).expect("create child directory");
+    fs::write(dir.join("directory/file"), vec![1_u8; 4096]).expect("write nested file");
+    fs::write(dir.join("plain"), b"plain").expect("write immediate file");
+    let (tx, rx) = mpsc::channel();
+
+    scan::scan_progressive(&dir, &AtomicBool::new(false), tx);
+    let events: Vec<_> = rx.into_iter().collect();
+
+    assert!(matches!(events.first(), Some(scan::ScanEvent::Initial(_))));
+    let initial = match &events[0] {
+        scan::ScanEvent::Initial(node) => node,
+        _ => unreachable!(),
+    };
+    assert_eq!(initial.children.len(), 2);
+    assert!(matches!(
+        events.get(1),
+        Some(scan::ScanEvent::ChildUpdated(_))
+    ));
+    assert!(matches!(events.last(), Some(scan::ScanEvent::Complete(_))));
+    let final_root = match events.last() {
+        Some(scan::ScanEvent::Complete(report)) => &report.root,
+        _ => unreachable!(),
+    };
+    let directory = final_root
+        .children
+        .iter()
+        .find(|node| node.name == "directory")
+        .expect("directory");
+    assert_eq!(
+        directory.apparent,
+        4096 + fs::symlink_metadata(dir.join("directory"))
+            .expect("stat directory")
+            .len()
+    );
+    fs::remove_dir_all(dir).expect("remove fixture");
+}
+
+#[test]
+fn parallel_progressive_scan_deduplicates_hardlinks_across_children() {
+    let dir = fixture();
+    for name in ["one", "two", "three", "four"] {
+        fs::create_dir(dir.join(name)).expect("create child directory");
+    }
+    fs::write(dir.join("one/file"), vec![3_u8; 8192]).expect("write linked file");
+    for name in ["two", "three", "four"] {
+        fs::hard_link(dir.join("one/file"), dir.join(name).join("file")).expect("create hardlink");
+    }
+    let (tx, rx) = mpsc::channel();
+
+    scan::scan_progressive(&dir, &AtomicBool::new(false), tx);
+    let report = rx
+        .into_iter()
+        .find_map(|event| match event {
+            scan::ScanEvent::Complete(report) => Some(report),
+            _ => None,
+        })
+        .expect("completion event");
+    let expected = fs::symlink_metadata(dir.join("one/file"))
+        .expect("stat linked file")
+        .len()
+        + fs::read_dir(&dir)
+            .expect("read root")
+            .map(|entry| {
+                fs::symlink_metadata(entry.expect("root entry").path())
+                    .expect("stat child directory")
+                    .len()
+            })
+            .sum::<u64>()
+        + fs::symlink_metadata(&dir).expect("stat root").len();
+
+    assert_eq!(report.root.apparent, expected);
+    fs::remove_dir_all(dir).expect("remove fixture");
+}
+
+#[test]
+fn progressive_scan_cancellation_keeps_initial_children_and_marks_partial() {
+    let dir = fixture();
+    for index in 0..64 {
+        let child = dir.join(format!("child-{index}"));
+        fs::create_dir(&child).expect("create child directory");
+        fs::write(child.join("file"), vec![0_u8; 64 * 1024]).expect("write nested file");
+    }
+    let cancel = AtomicBool::new(true);
+    let (tx, rx) = mpsc::channel();
+    scan::scan_progressive(&dir, &cancel, tx);
+    let events: Vec<_> = rx.into_iter().collect();
+    assert!(matches!(events.first(), Some(scan::ScanEvent::Initial(_))));
+    let report = events
+        .into_iter()
+        .find_map(|event| match event {
+            scan::ScanEvent::Complete(report) => Some(report),
+            _ => None,
+        })
+        .expect("completion event");
+    assert_eq!(report.root.status, scan::NodeStatus::Partial);
+    assert_eq!(report.root.children.len(), 64);
+    fs::remove_dir_all(dir).expect("remove fixture");
 }

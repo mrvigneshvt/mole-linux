@@ -205,7 +205,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 use rustix::fs::statvfs;
 
-use crate::scan::{EntryKind, Node, NodeStatus, ScanReport};
+use crate::scan::{EntryKind, Node, NodeStatus, ScanEvent, ScanReport};
 
 static TERMINAL_ACTIVE: GlobalAtomicBool = GlobalAtomicBool::new(false);
 
@@ -365,6 +365,24 @@ impl App {
     fn accept_report(&mut self, report: ScanReport) {
         self.navigator = Navigator::new(report.root);
         self.scanning = false;
+    }
+
+    fn accept_event(&mut self, event: ScanEvent) {
+        match event {
+            ScanEvent::Initial(root) => self.navigator = Navigator::new(root),
+            ScanEvent::ChildUpdated(updated) => {
+                if let Some(child) = self
+                    .navigator
+                    .root
+                    .children
+                    .iter_mut()
+                    .find(|child| child.name == updated.name)
+                {
+                    *child = updated;
+                }
+            }
+            ScanEvent::Complete(report) => self.accept_report(report),
+        }
     }
 }
 
@@ -556,7 +574,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     );
 }
 
-pub fn run(path: &Path, reports: Receiver<ScanReport>, cancel: Arc<AtomicBool>) -> io::Result<()> {
+pub fn run(path: &Path, reports: Receiver<ScanEvent>, cancel: Arc<AtomicBool>) -> io::Result<()> {
     install_panic_restore_hook();
     let mut terminal_guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
@@ -577,7 +595,7 @@ pub fn run(path: &Path, reports: Receiver<ScanReport>, cancel: Arc<AtomicBool>) 
 
     loop {
         match reports.try_recv() {
-            Ok(report) => app.accept_report(report),
+            Ok(event) => app.accept_event(event),
             Err(TryRecvError::Disconnected) if app.scanning => {
                 app.scanning = false;
                 app.scan_failed = true;

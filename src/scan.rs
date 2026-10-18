@@ -47,6 +47,10 @@ struct JsonOutput {
     entries: Vec<JsonEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     large_files: Vec<JsonFileEntry>,
+    apparent_bytes: u64,
+    allocated_bytes: u64,
+    total_apparent_bytes: u64,
+    total_allocated_bytes: u64,
     total_size: u64,
     total_files: u64,
 }
@@ -57,7 +61,10 @@ struct JsonEntry {
     name: String,
     name_bytes: Vec<u8>,
     path: String,
+    /// Upstream-compatible `size` field; reports allocated bytes.
     size: u64,
+    apparent_bytes: u64,
+    allocated_bytes: u64,
     is_dir: bool,
 }
 
@@ -66,7 +73,10 @@ struct JsonFileEntry {
     name: String,
     name_bytes: Vec<u8>,
     path: String,
+    /// Upstream-compatible `size` field; reports allocated bytes.
     size: u64,
+    apparent_bytes: u64,
+    allocated_bytes: u64,
 }
 
 /// Serializes the same scan tree used by the interactive analyzer.
@@ -93,11 +103,23 @@ pub fn report_json(report: &ScanReport, path: &Path) -> Result<String, serde_jso
             .map(|node| json_entry(node, &path.join(&node.name)))
             .collect(),
         large_files: files,
-        total_size: report
+        apparent_bytes: report.root.apparent,
+        allocated_bytes: report.root.allocated,
+        total_apparent_bytes: report
             .root
             .children
             .iter()
             .fold(0_u64, |total, child| total.saturating_add(child.apparent)),
+        total_allocated_bytes: report
+            .root
+            .children
+            .iter()
+            .fold(0_u64, |total, child| total.saturating_add(child.allocated)),
+        total_size: report
+            .root
+            .children
+            .iter()
+            .fold(0_u64, |total, child| total.saturating_add(child.allocated)),
         total_files,
     };
     serde_json::to_string_pretty(&output)
@@ -109,7 +131,9 @@ fn json_entry(node: &Node, path: &Path) -> JsonEntry {
         name: node.name.to_string_lossy().into_owned(),
         name_bytes: node.name.as_encoded_bytes().to_vec(),
         path: path.to_string_lossy().into_owned(),
-        size: node.apparent,
+        size: node.allocated,
+        apparent_bytes: node.apparent,
+        allocated_bytes: node.allocated,
         is_dir: node.kind == EntryKind::Directory,
     }
 }
@@ -122,7 +146,9 @@ fn collect_files(node: &Node, path: &Path, files: &mut Vec<JsonFileEntry>) {
                 name: child.name.to_string_lossy().into_owned(),
                 name_bytes: child.name.as_encoded_bytes().to_vec(),
                 path: child_path.to_string_lossy().into_owned(),
-                size: child.apparent,
+                size: child.allocated,
+                apparent_bytes: child.apparent,
+                allocated_bytes: child.allocated,
             });
         } else {
             collect_files(child, &child_path, files);
@@ -140,9 +166,10 @@ fn count_files(node: &Node) -> u64 {
 
 fn status_name(status: &NodeStatus) -> &'static str {
     match status {
-        NodeStatus::Complete | NodeStatus::Excluded(_) => "complete",
+        NodeStatus::Complete => "complete",
         NodeStatus::Partial => "partial",
         NodeStatus::Unavailable(_) => "unavailable",
+        NodeStatus::Excluded(_) => "excluded",
     }
 }
 

@@ -28,7 +28,7 @@ fn analyze_json_emits_scan_model_and_preserves_non_utf8_names() {
     assert_eq!(document["scan_status"], "complete");
     assert_eq!(document["path"], root.to_string_lossy().as_ref());
     assert_eq!(document["overview"], false);
-    assert_eq!(document["total_size"], 4);
+    assert_eq!(document["total_apparent_bytes"], 4);
     let entry = document["entries"]
         .as_array()
         .expect("entries array")
@@ -37,7 +37,8 @@ fn analyze_json_emits_scan_model_and_preserves_non_utf8_names() {
         .expect("entry with raw filename bytes");
     assert_eq!(entry["name"], "bad-�-name");
     assert_eq!(entry["scan_status"], "complete");
-    assert_eq!(entry["size"], 4);
+    assert_eq!(entry["apparent_bytes"], 4);
+    assert_eq!(entry["size"], entry["allocated_bytes"]);
 }
 
 #[test]
@@ -64,4 +65,51 @@ fn analyze_json_keeps_partial_and_unavailable_states() {
 
     assert_eq!(document["scan_status"], "partial");
     assert_eq!(document["entries"][0]["scan_status"], "unavailable");
+}
+
+#[test]
+fn analyze_json_reports_apparent_and_allocated_bytes_and_excluded_mounts() {
+    let root = Node {
+        name: "root".into(),
+        kind: EntryKind::Directory,
+        apparent: 4200,
+        allocated: 8192,
+        children: vec![
+            Node {
+                name: "payload.bin".into(),
+                kind: EntryKind::File,
+                apparent: 100,
+                allocated: 4096,
+                children: Vec::new(),
+                status: NodeStatus::Complete,
+            },
+            Node {
+                name: "mounted".into(),
+                kind: EntryKind::Directory,
+                apparent: 0,
+                allocated: 0,
+                children: Vec::new(),
+                status: NodeStatus::Excluded("mount boundary".to_owned()),
+            },
+        ],
+        status: NodeStatus::Complete,
+    };
+    let json =
+        mole_linux::scan::report_json(&ScanReport { root }, std::path::Path::new("/tmp/root"))
+            .expect("serialize report");
+    let document: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+    assert_eq!(document["apparent_bytes"], 4200);
+    assert_eq!(document["allocated_bytes"], 8192);
+    assert_eq!(document["total_apparent_bytes"], 100);
+    assert_eq!(document["total_allocated_bytes"], 4096);
+    assert_eq!(document["total_size"], 4096);
+    let entries = document["entries"].as_array().expect("entries array");
+    assert_eq!(entries[0]["size"], 4096);
+    assert_eq!(entries[0]["apparent_bytes"], 100);
+    assert_eq!(entries[0]["allocated_bytes"], 4096);
+    assert_eq!(entries[1]["scan_status"], "excluded");
+    assert_eq!(document["large_files"][0]["size"], 4096);
+    assert_eq!(document["large_files"][0]["apparent_bytes"], 100);
+    assert_eq!(document["large_files"][0]["allocated_bytes"], 4096);
 }

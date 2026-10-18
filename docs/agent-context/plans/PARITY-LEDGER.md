@@ -4,6 +4,12 @@ Pinned upstream `8c55e8c`. Generated 2026-10-19 from `clean_*`/`check_*` entry f
 
 Edit rules: one row per upstream entry point; never delete a row — set `dropped` with a reason.
 
+## Test environment
+
+| Unit | Milestone | Status | Evidence |
+|---|---|---|---|
+| Honeypot HOME, canaries, tool shims, Arch smoke | M0.1 | done | `tests/honeypot/README.md`; `tests/honeypot.rs` |
+
 ## Commands
 
 | Upstream | Milestone | Disposition | Status | Evidence |

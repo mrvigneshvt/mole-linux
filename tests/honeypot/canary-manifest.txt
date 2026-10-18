@@ -1,0 +1,9 @@
+.ssh/id_ed25519
+.env
+browser/Default/Cookies
+browser/Default/Cookies.db
+browser/Default/Cookies-wal
+browser/Default/Cookies-shm
+browser/Default/History.db
+project/.git/config
+project/.git/worktrees/linked/HEAD

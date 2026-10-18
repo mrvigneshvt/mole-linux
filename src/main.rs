@@ -180,7 +180,12 @@ fn run() -> io::Result<()> {
                 }
                 .map_err(|error| io::Error::other(format!("failed to encode JSON: {error}")))?;
                 let mut stdout = io::stdout().lock();
-                writeln!(stdout, "{json}")?;
+                if let Err(error) = writeln!(stdout, "{json}") {
+                    if error.kind() == io::ErrorKind::BrokenPipe {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
                 return Ok(());
             }
             match args.path {
@@ -416,13 +421,7 @@ fn run_overview() -> io::Result<()> {
     let worker = thread::Builder::new()
         .name("mole-overview".to_owned())
         .spawn(move || {
-            let report = scan::scan_overview(&roots, &worker_cancel);
-            report_tx
-                .send(scan::ScanEvent::Initial(report.root.clone()))
-                .map_err(io::Error::other)?;
-            report_tx
-                .send(scan::ScanEvent::Complete(report))
-                .map_err(io::Error::other)?;
+            scan::scan_overview_progressive(&roots, &worker_cancel, report_tx);
             Ok(())
         })?;
     let root_path = PathBuf::from("/");

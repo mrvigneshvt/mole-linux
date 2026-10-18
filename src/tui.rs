@@ -190,6 +190,38 @@ mod tests {
     }
 
     #[test]
+    fn overview_root_header_uses_overview_label() {
+        let mut root = node("/", EntryKind::Directory, vec![]);
+        root.children.push(Node {
+            name: OsString::from("Home"),
+            target_path: Some(PathBuf::from("/tmp/home")),
+            kind: EntryKind::Directory,
+            apparent: 0,
+            allocated: 0,
+            children: Vec::new(),
+            status: NodeStatus::Scanning,
+        });
+        let app = App::new(PathBuf::from("/"), root, None, true);
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render overview");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Overview"));
+        assert!(!rendered.contains("\n/\n"));
+        assert!(rendered.contains("d Home ?"));
+    }
+
+    #[test]
     fn test_backend_marks_excluded_mount_nodes_as_zero_size() {
         let mut root = sample_tree();
         root.children.push(Node {
@@ -595,10 +627,15 @@ impl Navigator {
         }
         path
     }
+
+    fn at_root(&self) -> bool {
+        self.levels.len() == 1
+    }
 }
 
 pub struct App {
     path: PathBuf,
+    overview: bool,
     pub navigator: Navigator,
     pub filesystem: Option<FilesystemStats>,
     pub scanning: bool,
@@ -616,8 +653,10 @@ impl App {
         filesystem: Option<FilesystemStats>,
         scanning: bool,
     ) -> Self {
+        let overview = root.children.iter().any(|node| node.target_path.is_some());
         Self {
             path,
+            overview,
             navigator: Navigator::new(root),
             filesystem,
             scanning,
@@ -637,6 +676,11 @@ impl App {
     }
 
     fn accept_report(&mut self, report: ScanReport) {
+        self.overview = report
+            .root
+            .children
+            .iter()
+            .any(|node| node.target_path.is_some());
         self.large_files = LargeFilesView::new(LargeFiles::from_tree(&report.root, &self.path));
         self.navigator = Navigator::new(report.root);
         self.scanning = false;
@@ -644,16 +688,26 @@ impl App {
 
     fn accept_event(&mut self, event: ScanEvent) {
         match event {
-            ScanEvent::Initial(root) => self.navigator = Navigator::new(root),
+            ScanEvent::Initial(root) => {
+                self.overview = root.children.iter().any(|node| node.target_path.is_some());
+                self.navigator = Navigator::new(root);
+            }
             ScanEvent::ChildUpdated(updated) => {
-                if let Some(child) = self
-                    .navigator
-                    .root
+                let root = &mut self.navigator.root;
+                if let Some(child) = root
                     .children
                     .iter_mut()
                     .find(|child| child.name == updated.name)
                 {
                     *child = updated;
+                    root.apparent = root
+                        .children
+                        .iter()
+                        .fold(0_u64, |sum, child| sum.saturating_add(child.apparent));
+                    root.allocated = root
+                        .children
+                        .iter()
+                        .fold(0_u64, |sum, child| sum.saturating_add(child.allocated));
                 }
             }
             ScanEvent::Complete(report) => self.accept_report(report),
@@ -697,7 +751,7 @@ pub fn percentage(parent_status: &NodeStatus, child: u64, parent: u64) -> Option
     if parent == 0
         || matches!(
             parent_status,
-            NodeStatus::Partial | NodeStatus::Unavailable(_)
+            NodeStatus::Scanning | NodeStatus::Partial | NodeStatus::Unavailable(_)
         )
     {
         return None;
@@ -708,6 +762,7 @@ pub fn percentage(parent_status: &NodeStatus, child: u64, parent: u64) -> Option
 
 fn size_for_node(node: &Node, mode: SizeMode) -> String {
     match &node.status {
+        NodeStatus::Scanning => "?".to_owned(),
         NodeStatus::Unavailable(_) => "?".to_owned(),
         NodeStatus::Excluded(_) => "0 B".to_owned(),
         NodeStatus::Partial => format!("~{}", format_size(size_for_mode(node, mode))),
@@ -745,6 +800,7 @@ fn kind_marker(node: &Node) -> &'static str {
 
 fn status_label(status: &NodeStatus) -> String {
     match status {
+        NodeStatus::Scanning => "Scanning".to_owned(),
         NodeStatus::Complete => "Complete".to_owned(),
         NodeStatus::Partial => "Partial".to_owned(),
         NodeStatus::Unavailable(reason) => {
@@ -783,10 +839,13 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else {
         status_label(&current.status)
     };
+    let heading = if app.overview && app.navigator.at_root() {
+        "Overview".to_owned()
+    } else {
+        escape_name(app.navigator.current_path(&app.path).as_os_str())
+    };
     let mut header_lines = vec![
-        Line::from(escape_name(
-            app.navigator.current_path(&app.path).as_os_str(),
-        )),
+        Line::from(heading),
         Line::from(format!(
             "Allocated: {} | Apparent: {}",
             size_for_node(current, SizeMode::Allocated),

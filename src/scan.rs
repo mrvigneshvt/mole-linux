@@ -18,6 +18,7 @@ pub enum EntryKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeStatus {
+    Scanning,
     Complete,
     Partial,
     Unavailable(String),
@@ -83,6 +84,8 @@ impl OverviewRoots {
     }
 }
 
+const MAX_CONCURRENT_OVERVIEW_ROOTS: usize = 4;
+
 /// Scans the Linux overview roots independently and retains unavailable roots as rows.
 // Ported from tw93/Mole cmd/analyze/main.go:createOverviewEntries (GPL-3.0)
 pub fn scan_overview(roots: &OverviewRoots, cancel: &AtomicBool) -> ScanReport {
@@ -121,6 +124,102 @@ pub fn scan_overview(roots: &OverviewRoots, cancel: &AtomicBool) -> ScanReport {
             status,
         },
     }
+}
+
+/// Publishes overview rows immediately, then measures independent roots with a fixed worker cap.
+pub fn scan_overview_progressive(
+    roots: &OverviewRoots,
+    cancel: &AtomicBool,
+    events: Sender<ScanEvent>,
+) {
+    let labeled = roots.labeled();
+    let mut root = Node {
+        name: "/".into(),
+        target_path: None,
+        kind: EntryKind::Directory,
+        apparent: 0,
+        allocated: 0,
+        children: labeled
+            .iter()
+            .map(|(label, path)| Node {
+                name: (*label).into(),
+                target_path: Some(path.to_path_buf()),
+                kind: EntryKind::Directory,
+                apparent: 0,
+                allocated: 0,
+                children: Vec::new(),
+                status: NodeStatus::Scanning,
+            })
+            .collect(),
+        status: NodeStatus::Scanning,
+    };
+    if !publish_event(&events, cancel, ScanEvent::Initial(root.clone())) {
+        return;
+    }
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (updates_tx, updates_rx) = std::sync::mpsc::channel();
+    let worker_count = labeled.len().min(MAX_CONCURRENT_OVERVIEW_ROOTS);
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let labeled = &labeled;
+            let updates_tx = updates_tx.clone();
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((label, path)) = labeled.get(index) else {
+                        break;
+                    };
+                    let mut node = scan(path, cancel).root;
+                    node.name = (*label).into();
+                    node.target_path = Some(path.to_path_buf());
+                    if updates_tx.send(node).is_err() {
+                        cancel.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            });
+        }
+        drop(updates_tx);
+        for updated in updates_rx {
+            let Some(row) = root
+                .children
+                .iter_mut()
+                .find(|row| row.name == updated.name)
+            else {
+                continue;
+            };
+            *row = updated;
+            let updated = row.clone();
+            root.apparent = root
+                .children
+                .iter()
+                .fold(0_u64, |sum, child| sum.saturating_add(child.apparent));
+            root.allocated = root
+                .children
+                .iter()
+                .fold(0_u64, |sum, child| sum.saturating_add(child.allocated));
+            if !publish_event(&events, cancel, ScanEvent::ChildUpdated(updated)) {
+                break;
+            }
+        }
+    });
+
+    if cancel.load(Ordering::Relaxed)
+        || root
+            .children
+            .iter()
+            .any(|row| !matches!(row.status, NodeStatus::Complete))
+    {
+        root.status = NodeStatus::Partial;
+    } else {
+        root.status = NodeStatus::Complete;
+    }
+    publish_event(&events, cancel, ScanEvent::Complete(ScanReport { root }));
 }
 
 pub fn overview_json(report: &ScanReport) -> Result<String, serde_json::Error> {
@@ -275,6 +374,7 @@ fn count_files(node: &Node) -> u64 {
 
 fn status_name(status: &NodeStatus) -> &'static str {
     match status {
+        NodeStatus::Scanning => "scanning",
         NodeStatus::Complete => "complete",
         NodeStatus::Partial => "partial",
         NodeStatus::Unavailable(_) => "unavailable",

@@ -100,3 +100,113 @@ fn injected_missing_overview_root_is_retained_as_unavailable() {
         assert_eq!(row["scan_status"], "unavailable");
     }
 }
+
+#[test]
+fn progressive_overview_publishes_scanning_rows_before_root_measurements() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let fixture = tempdir().expect("fixture root");
+    let home = fixture.path().join("home");
+    let cache = fixture.path().join("cache");
+    let data = fixture.path().join("data");
+    let state = fixture.path().join("state");
+    for path in [&home, &cache, &data, &state] {
+        fs::create_dir_all(path).expect("create overview fixture");
+    }
+    let roots = OverviewRoots {
+        home,
+        cache,
+        data: data.clone(),
+        state,
+        trash: data.join("Trash/files"),
+        pacman_cache: fixture.path().join("missing-pacman"),
+        journal: fixture.path().join("missing-journal"),
+        docker: fixture.path().join("missing-docker"),
+    };
+    let cancel = AtomicBool::new(false);
+    let (events_tx, events_rx) = mpsc::channel();
+
+    let worker = std::thread::spawn(move || {
+        scan::scan_overview_progressive(&roots, &cancel, events_tx);
+    });
+
+    let initial = events_rx
+        .recv_timeout(Duration::from_millis(250))
+        .expect("initial overview arrives before measurement");
+    let scan::ScanEvent::Initial(root) = initial else {
+        panic!("first overview event is Initial");
+    };
+    assert_eq!(root.children.len(), 8);
+    assert!(
+        root.children
+            .iter()
+            .all(|row| row.status == scan::NodeStatus::Scanning)
+    );
+    drop(events_rx);
+    worker
+        .join()
+        .expect("overview worker exits after receiver closes");
+}
+
+#[test]
+fn progressive_overview_publishes_each_root_result() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let fixture = tempdir().expect("fixture root");
+    let home = fixture.path().join("home");
+    let cache = fixture.path().join("cache");
+    let data = fixture.path().join("data");
+    let state = fixture.path().join("state");
+    for path in [&home, &cache, &data, &state] {
+        fs::create_dir_all(path).expect("create overview fixture");
+    }
+    let roots = OverviewRoots {
+        home,
+        cache,
+        data: data.clone(),
+        state,
+        trash: data.join("Trash/files"),
+        pacman_cache: fixture.path().join("missing-pacman"),
+        journal: fixture.path().join("missing-journal"),
+        docker: fixture.path().join("missing-docker"),
+    };
+    let (events_tx, events_rx) = mpsc::channel();
+    let cancel = AtomicBool::new(false);
+    let worker = std::thread::spawn(move || {
+        scan::scan_overview_progressive(&roots, &cancel, events_tx);
+    });
+
+    let initial = events_rx
+        .recv_timeout(Duration::from_millis(250))
+        .expect("initial overview arrives immediately");
+    assert!(matches!(initial, scan::ScanEvent::Initial(_)));
+    let mut updated = 0_usize;
+    loop {
+        match events_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("overview root completes")
+        {
+            scan::ScanEvent::ChildUpdated(row) => {
+                assert_ne!(row.status, scan::NodeStatus::Scanning);
+                updated = updated.saturating_add(1);
+            }
+            scan::ScanEvent::Complete(report) => {
+                assert_eq!(updated, 8);
+                assert!(
+                    report
+                        .root
+                        .children
+                        .iter()
+                        .all(|row| row.status != scan::NodeStatus::Scanning)
+                );
+                break;
+            }
+            scan::ScanEvent::Initial(_) => panic!("overview publishes one Initial event"),
+        }
+    }
+    worker.join().expect("overview scan finishes");
+}

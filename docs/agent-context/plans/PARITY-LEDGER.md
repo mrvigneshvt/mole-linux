@@ -8,15 +8,15 @@ Edit rules: one row per upstream entry point; never delete a row — set `droppe
 
 | Upstream | Milestone | Disposition | Status | Evidence |
 |---|---|---|---|---|
-| `mo analyze` | M1, M2 | Port | wip (M1, M2.1 done) | plans/M1-analyzer.md; issue #4 progressive events, parallel hardlink dedupe, cancellation |
-| `mo status` | M9.1 | Adapt | todo | |
-| `mo clean` | M4–M6 | Adapt | todo | |
-| `mo purge` | M7.1 | Port | todo | |
-| `mo installer` | M7.2 | Adapt | todo | |
-| `mo uninstall` | M8 | Replace | todo | |
-| `mo optimize` | M9.2 | Replace | todo | |
-| `mo history` | M3.3 | Port | todo | |
-| `mo completion` | M9.4 | Port | todo | |
+| `mo analyze` | M1, M2 | Port | wip (M1, M2.1 done; M0.2 clap routing) | plans/M1-analyzer.md; issue #3 CLI; issue #4 progressive events, parallel hardlink dedupe, cancellation |
+| `mo status` | M9.1 | Adapt | wip (M0.2 CLI surface; behavior pending) | issue #3 |
+| `mo clean` | M4–M6 | Adapt | wip (M0.2 CLI surface; behavior pending) | issue #3 |
+| `mo purge` | M7.1 | Port | wip (M0.2 CLI surface; behavior pending) | issue #3 |
+| `mo installer` | M7.2 | Adapt | wip (M0.2 CLI surface; behavior pending) | issue #3 |
+| `mo uninstall` | M8 | Replace | wip (M0.2 CLI surface; behavior pending) | issue #3 |
+| `mo optimize` | M9.2 | Replace | wip (M0.2 CLI surface; behavior pending) | issue #3 |
+| `mo history` | M3.3 | Port | wip (M0.2 CLI surface; behavior pending) | issue #3 |
+| `mo completion` | M9.4 | Port | wip (M0.2 CLI surface; behavior pending) | issue #3 |
 | menu | M9.3 | Port | todo | |
 | `mo update`/`remove` | M10 | Drop/decide | todo | packaged installs owned by pacman |
 | `mo touchid` | — | Drop | dropped | auth/PAM change outside scope (research/upstream-lifecycle-maintenance.md) |

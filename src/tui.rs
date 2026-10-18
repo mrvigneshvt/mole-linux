@@ -196,6 +196,7 @@ mod tests {
             name: OsString::from("Home"),
             target_path: Some(PathBuf::from("/tmp/home")),
             kind: EntryKind::Directory,
+            cleanable: false,
             apparent: 0,
             allocated: 0,
             children: Vec::new(),

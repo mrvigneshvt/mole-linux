@@ -102,6 +102,46 @@ fn injected_missing_overview_root_is_retained_as_unavailable() {
 }
 
 #[test]
+fn overview_rows_preserve_cleanable_hints_from_scanned_roots() {
+    let fixture = tempdir().expect("fixture root");
+    let home = fixture.path().join("node_modules");
+    let cache = fixture.path().join("cache");
+    let data = fixture.path().join("data");
+    let state = fixture.path().join("state");
+    for path in [&home, &cache, &data, &state] {
+        fs::create_dir_all(path).expect("create overview fixture");
+    }
+    let roots = OverviewRoots {
+        home,
+        cache,
+        data: data.clone(),
+        state,
+        trash: data.join("Trash/files"),
+        pacman_cache: fixture.path().join("missing-pacman"),
+        journal: fixture.path().join("missing-journal"),
+        docker: fixture.path().join("missing-docker"),
+    };
+
+    let report = scan::scan_overview(&roots, &std::sync::atomic::AtomicBool::new(false));
+    let home_row = report
+        .root
+        .children
+        .iter()
+        .find(|row| row.name == "Home")
+        .expect("Home overview row");
+    assert!(home_row.cleanable);
+    let json = scan::overview_json(&report).expect("serialize overview");
+    let document: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    let home_json = document["entries"]
+        .as_array()
+        .expect("overview entries")
+        .iter()
+        .find(|row| row["name"] == "Home")
+        .expect("Home JSON row");
+    assert_eq!(home_json["cleanable"], true);
+}
+
+#[test]
 fn progressive_overview_publishes_scanning_rows_before_root_measurements() {
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
@@ -157,7 +197,7 @@ fn progressive_overview_publishes_each_root_result() {
     use std::time::Duration;
 
     let fixture = tempdir().expect("fixture root");
-    let home = fixture.path().join("home");
+    let home = fixture.path().join("node_modules");
     let cache = fixture.path().join("cache");
     let data = fixture.path().join("data");
     let state = fixture.path().join("state");
@@ -202,6 +242,14 @@ fn progressive_overview_publishes_each_root_result() {
                         .children
                         .iter()
                         .all(|row| row.status != scan::NodeStatus::Scanning)
+                );
+                assert!(
+                    report
+                        .root
+                        .children
+                        .iter()
+                        .find(|row| row.name == "Home")
+                        .is_some_and(|row| row.cleanable)
                 );
                 break;
             }

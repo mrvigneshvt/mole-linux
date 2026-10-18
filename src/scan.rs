@@ -118,6 +118,7 @@ pub fn scan_overview(roots: &OverviewRoots, cancel: &AtomicBool) -> ScanReport {
             name: "/".into(),
             target_path: None,
             kind: EntryKind::Directory,
+            cleanable: false,
             apparent,
             allocated,
             children,
@@ -137,6 +138,7 @@ pub fn scan_overview_progressive(
         name: "/".into(),
         target_path: None,
         kind: EntryKind::Directory,
+        cleanable: false,
         apparent: 0,
         allocated: 0,
         children: labeled
@@ -145,6 +147,7 @@ pub fn scan_overview_progressive(
                 name: (*label).into(),
                 target_path: Some(path.to_path_buf()),
                 kind: EntryKind::Directory,
+                cleanable: false,
                 apparent: 0,
                 allocated: 0,
                 children: Vec::new(),

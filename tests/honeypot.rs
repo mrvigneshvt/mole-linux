@@ -14,26 +14,48 @@ fn builds_realistic_home_and_canaries_survive() {
         ".config",
         ".cache",
         ".local/share",
-        ".mozilla/firefox/profile",
+        ".config/chromium/Default/Cookies",
+        ".config/chromium/Default/History",
+        ".config/chromium/Default/Login Data",
+        ".config/google-chrome/Default/Cookies",
+        ".mozilla/firefox/x.default-release/places.sqlite",
+        ".mozilla/firefox/x.default-release/places.sqlite-wal",
+        ".mozilla/firefox/x.default-release/cookies.sqlite",
         ".ssh/id_ed25519",
-        ".env",
+        ".gnupg/private-keys-v1.d/key.key",
+        ".local/share/keyrings/login.keyring",
+        "project/.env",
+        "Documents/thesis.odt",
+        "Pictures/photo.jpg",
+        ".local/share/docker-volume-like/volumes/db/data",
+        "models/llama.gguf",
+        ".local/share/app/db.sqlite",
+        ".local/share/app/db.sqlite-wal",
+        ".local/share/app/db.sqlite-shm",
+        "project/src/main.rs",
+        "project/.git/HEAD",
+        "project/node_modules/authored-package/index.js",
+        ".config/mole-linux/whitelist-protected/file",
         ".npm/_cacache",
         ".cache/pnpm",
         ".cache/uv",
         ".cargo/registry",
         ".gradle/caches",
-        "project/node_modules",
-        "project/target",
+        ".cache/chromium/Default/Cache",
+        ".cache/mozilla/firefox/x.default-release/cache2",
+        ".cache/thumbnails",
+        ".cache/yay/pkg-build",
+        "project/src/__pycache__",
+        "cargo-project/Cargo.toml",
+        "cargo-project/target",
         "project/.git",
         "project-linked/.git",
         "Downloads/installer.AppImage",
         ".local/share/Trash/files/old",
-        "browser/Default/Cache",
-        "browser/Default/Cookies",
-        "browser/Default/Cookies-wal",
     ] {
         assert!(home.join(relative).exists(), "missing {relative}");
     }
+    assert!(!home.join("project/node_modules/.keep-authored").exists());
 
     fixture.assert_canaries_intact().expect("canaries intact");
     fs::write(home.join(".ssh/id_ed25519"), "modified").expect("modify canary");
@@ -74,4 +96,48 @@ fn fixture_builder_refuses_to_overlay_an_existing_home() {
         fs::read_to_string(home.join("keep")).expect("read existing file"),
         "unchanged"
     );
+}
+
+#[test]
+fn fixture_contains_a_real_tracked_repo_and_untracked_worktree_content() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let home = temp.path().join("home");
+    let _fixture = fixtures::HomeFixture::build(&home).expect("build honeypot");
+
+    let tracked = Command::new("git")
+        .args([
+            "-C",
+            home.join("project").to_str().expect("utf8 path"),
+            "ls-files",
+            "--error-unmatch",
+            "src/main.rs",
+        ])
+        .output()
+        .expect("query tracked file");
+    assert!(tracked.status.success());
+
+    let untracked = Command::new("git")
+        .args([
+            "-C",
+            home.join("project").to_str().expect("utf8 path"),
+            "ls-files",
+            "--error-unmatch",
+            "node_modules/authored-package/index.js",
+        ])
+        .output()
+        .expect("query authored dependency file");
+    assert!(!untracked.status.success());
+
+    let worktrees = Command::new("git")
+        .args([
+            "-C",
+            home.join("project").to_str().expect("utf8 path"),
+            "worktree",
+            "list",
+            "--porcelain",
+        ])
+        .output()
+        .expect("list worktrees");
+    assert!(worktrees.status.success());
+    assert!(String::from_utf8_lossy(&worktrees.stdout).contains("project-linked"));
 }

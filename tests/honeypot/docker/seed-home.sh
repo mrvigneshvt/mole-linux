@@ -1,25 +1,51 @@
 #!/bin/bash
 set -euo pipefail
-
 home=${1:?usage: seed-home.sh HOME}
-mkdir -p "$home"/{.config,.cache,.local/share,.local/state,.mozilla/firefox/profile,.npm/_cacache,.cache/pnpm/store/v3,.cache/uv/archive-v0,.cargo/registry/src,.gradle/caches/modules-2,project/node_modules,project/target,project/.git/objects,project/.git/refs/heads,project/.git/worktrees/linked,project-linked,browser/Default/Cache,browser/Default}
-mkdir -p "$home/Downloads" "$home/.local/share/Trash/files" "$home/.local/share/Trash/info" "$home/.ssh"
-printf 'fixture installer\n' > "$home/Downloads/installer.AppImage"
-printf 'old trashed file\n' > "$home/.local/share/Trash/files/old"
-printf '[core]\n\trepositoryformatversion = 0\n' > "$home/project/.git/config"
-printf 'ref: refs/heads/main\n' > "$home/project/.git/HEAD"
-printf 'ref: refs/heads/main\n' > "$home/project/.git/worktrees/linked/HEAD"
-printf '../../../../project-linked/.git\n' > "$home/project/.git/worktrees/linked/gitdir"
-printf 'gitdir: ../project/.git/worktrees/linked\n' > "$home/project-linked/.git"
-
-manifest=/usr/local/share/mole-honeypot/canary-manifest.txt
-while IFS= read -r relative; do
-    [[ -n "$relative" ]] || continue
-    mkdir -p "$home/$(dirname "$relative")"
-    if [[ "$relative" == *.db ]]; then
-        printf 'SQLite format 3\0mole-linux protected canary: %s\n' "$relative" > "$home/$relative"
-    else
-        printf 'mole-linux protected canary: %s\n' "$relative" > "$home/$relative"
-    fi
+manifest=/usr/local/share/mole-honeypot/manifest.tsv
+repository=
+linked_worktree=
+tracked_file=
+while IFS=$'\t' read -r kind relative; do
+    [[ -n "$kind" && "$kind" != \#* ]] || continue
+    path="$home/$relative"
+    case "$kind" in
+        dir) mkdir -p "$path" ;;
+        git-repo) repository="$relative" ;;
+        git-track)
+            tracked_file="$relative"
+            mkdir -p "$(dirname "$path")"
+            printf 'fn main() { println!("fixture project"); }\n' > "$path"
+            ;;
+        worktree) linked_worktree="$relative" ;;
+        canary|target-file|authored-file|cargo-manifest)
+            worktree_name=${linked_worktree##*/}
+            if [[ "$kind" == canary && ( "$relative" == "$repository/.git/HEAD" || "$relative" == "$repository/.git/worktrees/$worktree_name/HEAD" ) ]]; then
+                continue
+            fi
+            mkdir -p "$(dirname "$path")"
+            case "$kind" in
+                authored-file) printf '// authored local package, deliberately untracked\n' > "$path" ;;
+                cargo-manifest) printf '[package]\nname = "honeypot-target"\nversion = "0.1.0"\nedition = "2024"\n' > "$path" ;;
+                *) printf 'mole-linux fixture file: %s\n' "$relative" > "$path" ;;
+            esac
+            ;;
+        sqlite-canary)
+            mkdir -p "$(dirname "$path")"
+            printf 'SQLite format 3\0mole-linux canary: %s\n' "$relative" > "$path"
+            ;;
+        *) printf 'unknown manifest kind: %s\n' "$kind" >&2; exit 1 ;;
+    esac
 done < "$manifest"
-(cd "$home" && xargs sha256sum < "$manifest" > canary.sha256)
+export HOME="$home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+tracked_relative=${tracked_file#"$repository"/}
+git -c init.defaultBranch=main init "$home/$repository"
+git -C "$home/$repository" config user.name 'Honeypot Fixture'
+git -C "$home/$repository" config user.email honeypot@example.invalid
+git -C "$home/$repository" add "$tracked_relative"
+git -C "$home/$repository" commit -m 'seed honeypot project'
+git -C "$home/$repository" worktree add -b linked "$home/$linked_worktree"
+checksum_file="$home/canary.sha256"
+while IFS=$'\t' read -r kind relative; do
+    [[ "$kind" == canary || "$kind" == sqlite-canary || "$kind" == git-track ]] || continue
+    (cd "$home" && sha256sum "$relative") >> "$checksum_file"
+done < "$manifest"

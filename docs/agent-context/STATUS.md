@@ -36,3 +36,5 @@ branding and potential upstream code reuse before release; see
 - 2026-10-19: T1 scanner accepted after review round 1 (mount Excluded status, dir inode size, explicit stack). Orchestrator verified clippy + 10 tests. T2 (TUI) dispatched.
 - 2026-10-19: M1 T2 TUI accepted after review round 1 (header followed root, not the current dir). Orchestrator verified: clippy clean, 18 tests, live tmux run, totals == du. Uncommitted. Next: commit decision, progressive scan, LICENSE file.
 - 2026-10-19: Committed M1 analyzer (feat) on branch plan-linux-mole-tool-b4f9a8b8 with .gitignore. Not pushed. Next: M1.1 progressive scan plan.
+- 2026-10-19: Drafted full-parity closed-loop plan [plans/PARITY-ROADMAP.md](plans/PARITY-ROADMAP.md) + generated [plans/PARITY-LEDGER.md](plans/PARITY-LEDGER.md) (upstream entry functions + tests; dispositions proposed). Awaiting owner approval; nothing dispatched.
+- 2026-10-19: Owner approved roadmap + autonomous run ([decision](decisions/2026-10-19-autonomous-run.md)). Added root AGENTS.md for workers. Next: GitHub issues, honeypot, dispatch.

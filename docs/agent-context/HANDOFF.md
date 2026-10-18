@@ -22,7 +22,7 @@ The owner asked whether [tw93/Mole](https://github.com/tw93/Mole/) supports this
 ## Immediate next steps (updated 2026-10-19, after M1)
 
 1. M1 analyzer TUI is implemented and committed — see [plans/M1-analyzer.md](plans/M1-analyzer.md), [STATUS.md](STATUS.md), [KNOWN-GAPS.md](KNOWN-GAPS.md).
-2. Proposed M1.1: progressive results (paint children immediately, sizes stream in) + bounded parallel scan; benchmark vs `du` (release build). Needs a plan file before dispatch.
+2. Full-parity plan drafted: [plans/PARITY-ROADMAP.md](plans/PARITY-ROADMAP.md) (closed loop, M2–M10) + [plans/PARITY-LEDGER.md](plans/PARITY-LEDGER.md). Awaiting owner approval; M1.1 progressive scan is now M2.1.
 3. Add GPL-3.0 LICENSE text; choose a non-Mole name before public release.
 4. Working model: this repo is orchestrated from a Claude session (CTO/QA/reviewer) dispatching Codex `gpt-6-luna` medium workers via Superset (`superset agents create --agent codex --model gpt-6-luna --effort medium`). Orchestrator reruns checks and drives the live TUI in tmux before accepting. Fast tier needs `service_tier="priority"`, not passable via Superset CLI.
 

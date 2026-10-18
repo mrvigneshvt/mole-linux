@@ -74,11 +74,14 @@ fn snapshots_reports_unavailable_when_tools_are_missing() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("Unavailable: neither btrfs nor snapper is installed"),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+        stdout.contains("Btrfs subvolumes/snapshots: Unavailable (not installed)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Snapper snapshots: Unavailable (not installed)"),
+        "{stdout}"
     );
 }
 
@@ -102,5 +105,66 @@ fn snapshots_marks_tool_errors_unavailable_instead_of_reporting_zero() {
     assert!(
         !stdout.contains("Btrfs subvolumes/snapshots (0 entries)"),
         "{stdout}"
+    );
+}
+
+#[test]
+fn snapper_permission_error_shows_stderr_and_never_suggests_tool_escalation() {
+    let temp = tempdir().expect("temp dir");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).expect("bin dir");
+    install_shim(&bin, "btrfs", "exit 0");
+    install_shim(
+        &bin,
+        "snapper",
+        "printf 'No permissions.\\001' >&2; i=0; while [ \"$i\" -lt 500 ]; do printf x >&2; i=$((i + 1)); done; printf '\\n' >&2; printf '%s\\n' 'second line must not be shown' >&2; exit 1",
+    );
+
+    let output = run_with_path(&bin);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No permissions."), "{stdout}");
+    assert!(
+        stdout.contains("\\u{1}"),
+        "control character was not escaped: {stdout}"
+    );
+    assert!(stdout.contains("requires root; run `sudo snapper list` yourself — mole-linux does not escalate for read-only listings"), "{stdout}");
+    assert!(
+        !stdout.contains("second line must not be shown"),
+        "{stdout}"
+    );
+    let reason = stdout
+        .lines()
+        .find(|line| line.starts_with("Snapper snapshots: Unavailable"))
+        .expect("Snapper reason");
+    assert!(
+        reason.chars().count() < 400,
+        "stderr reason was not capped: {} chars",
+        reason.chars().count()
+    );
+}
+
+#[test]
+fn missing_snapper_binary_is_reported_individually() {
+    let temp = tempdir().expect("temp dir");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).expect("bin dir");
+    install_shim(&bin, "btrfs", "exit 0");
+
+    let output = run_with_path(&bin);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("Snapper snapshots: Unavailable (not installed)"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }

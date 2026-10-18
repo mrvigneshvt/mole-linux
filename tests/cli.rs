@@ -10,9 +10,8 @@ fn run(args: &[&str]) -> Output {
 }
 
 #[test]
-fn unimplemented_subcommands_parse_flags_and_exit_two() {
+fn unsupported_subcommands_parse_flags_and_exit_two() {
     let cases: &[(&[&str], u32)] = &[
-        (&["status", "--json", "--watch", "--interval", "2"], 37),
         (
             &[
                 "clean",
@@ -273,6 +272,22 @@ fn completion_follows_rc_symlinks_and_refuses_broken_or_cyclic_chains() {
         .expect("run cyclic link case");
     assert!(!cyclic.status.success());
     assert!(String::from_utf8_lossy(&cyclic.stderr).contains("cyclic symbolic link"));
+}
+
+#[test]
+fn status_json_emits_a_snapshot() {
+    let output = run(&["status", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid status JSON");
+    assert!(value.get("cpu").is_some());
+    assert!(value.get("memory").is_some());
+    assert!(value.get("disk_io").is_some());
+    assert!(value.get("processes").is_some());
 }
 
 #[test]

@@ -33,7 +33,7 @@ Linux-first Rust port of [tw93/Mole](https://github.com/tw93/Mole) (macOS cleane
 3. Minimal implementation. Then:
    `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test`
 4. If your unit is user-visible, run the binary (TUI via tmux) against a temp HOME or the honeypot and report what you saw.
-5. Update your ledger rows and, for caveats/shortcuts (`ponytail:` comments), `docs/agent-context/KNOWN-GAPS.md`.
+5. Do not edit `docs/agent-context/STATUS.md` or `ORCHESTRATION.md` (orchestrator-owned). Update your ledger rows and, for caveats/shortcuts (`ponytail:` comments), `docs/agent-context/KNOWN-GAPS.md`.
 6. Commit (Conventional Commits, `Closes #<issue>` in body). Do **not** push or open PRs — the orchestrator does.
 7. End with:
 

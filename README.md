@@ -4,7 +4,7 @@ A Rust-based, Linux-first cleanup and system-inspection tool, inspired by the ki
 
 ## Status
 
-Early scaffold. No cleanup or inspection commands are implemented. Initial target is Omarchy/Arch Linux; broader Linux support is undecided.
+M1: read-only storage analyzer TUI (`cargo run -- <path>`). No cleanup commands yet. Initial target is Omarchy/Arch Linux; broader Linux support is undecided.
 
 ## Build
 

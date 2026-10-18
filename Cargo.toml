@@ -3,7 +3,12 @@ name = "mole-linux"
 version = "0.1.0"
 edition = "2024"
 description = "A Linux-first system cleanup and inspection tool"
-license = "MIT"
+license = "GPL-3.0-only"
+
+[dependencies]
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+crossterm = "0.29.0"
+rustix = { version = "1", features = ["fs"] }
 
 [[bin]]
 name = "mole-linux"

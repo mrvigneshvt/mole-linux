@@ -9,7 +9,8 @@ mod tests {
     use crate::scan::{EntryKind, Node, NodeStatus};
 
     use super::{
-        App, FilesystemStats, Navigator, SizeMode, escape_name, format_size, percentage, render,
+        App, FilesystemStats, FilesystemType, Navigator, SizeMode, escape_name,
+        filesystem_type_from_magic, format_size, percentage, render,
     };
 
     fn node(name: &str, kind: EntryKind, children: Vec<Node>) -> Node {
@@ -94,6 +95,7 @@ mod tests {
             Some(FilesystemStats {
                 free_bytes: 8 * 1024 * 1024,
                 total_bytes: 16 * 1024 * 1024,
+                filesystem_type: None,
             }),
             false,
         );
@@ -113,6 +115,44 @@ mod tests {
         assert!(rendered.contains("Allocated"));
         assert!(rendered.contains("first"));
         assert!(rendered.contains("[##########] 100%"));
+    }
+
+    #[test]
+    fn filesystem_magic_maps_btrfs_and_other_filesystems() {
+        assert_eq!(
+            filesystem_type_from_magic(0x9123_683e),
+            FilesystemType::Btrfs
+        );
+        assert_eq!(filesystem_type_from_magic(0xef53), FilesystemType::Other);
+    }
+
+    #[test]
+    fn btrfs_header_warns_shared_and_snapshot_space_is_not_counted() {
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let app = App::new(
+            PathBuf::from("/tmp/example"),
+            sample_tree(),
+            Some(FilesystemStats {
+                free_bytes: 8 * 1024 * 1024,
+                total_bytes: 16 * 1024 * 1024,
+                filesystem_type: Some(FilesystemType::Btrfs),
+            }),
+            false,
+        );
+
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render btrfs warning");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("snapshot/shared extents not counted"));
     }
 
     #[test]
@@ -235,7 +275,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
-use rustix::fs::statvfs;
+use rustix::fs::{statfs, statvfs};
 
 use crate::scan;
 use crate::scan::{EntryKind, Node, NodeStatus, ScanEvent, ScanReport};
@@ -416,14 +456,34 @@ impl LargeFilesView {
 pub struct FilesystemStats {
     pub free_bytes: u64,
     pub total_bytes: u64,
+    pub filesystem_type: Option<FilesystemType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesystemType {
+    Btrfs,
+    Other,
+}
+
+fn filesystem_type_from_magic(magic: u64) -> FilesystemType {
+    if magic == 0x9123_683e {
+        FilesystemType::Btrfs
+    } else {
+        FilesystemType::Other
+    }
 }
 
 impl FilesystemStats {
     fn for_path(path: &Path) -> Option<Self> {
         let stats = statvfs(path).ok()?;
+        let filesystem_type = statfs(path)
+            .ok()
+            .and_then(|stats| u64::try_from(stats.f_type).ok())
+            .map(filesystem_type_from_magic);
         Some(Self {
             free_bytes: stats.f_bavail.checked_mul(stats.f_frsize)?,
             total_bytes: stats.f_blocks.checked_mul(stats.f_frsize)?,
+            filesystem_type,
         })
     }
 }
@@ -681,10 +741,13 @@ fn status_label(status: &NodeStatus) -> String {
 }
 
 fn render(frame: &mut Frame<'_>, app: &App) {
+    let btrfs = app
+        .filesystem
+        .is_some_and(|stats| stats.filesystem_type == Some(FilesystemType::Btrfs));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(if btrfs { 4 } else { 3 }),
             Constraint::Min(1),
             Constraint::Length(1),
         ])
@@ -706,7 +769,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else {
         status_label(&current.status)
     };
-    let header = Paragraph::new(vec![
+    let mut header_lines = vec![
         Line::from(escape_name(
             app.navigator.current_path(&app.path).as_os_str(),
         )),
@@ -716,7 +779,11 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             size_for_node(current, SizeMode::Apparent)
         )),
         Line::from(format!("{fs_line} | {scan_label}")),
-    ]);
+    ];
+    if btrfs {
+        header_lines.push(Line::from("snapshot/shared extents not counted"));
+    }
+    let header = Paragraph::new(header_lines);
     frame.render_widget(header, chunks[0]);
 
     if app.show_large_files {

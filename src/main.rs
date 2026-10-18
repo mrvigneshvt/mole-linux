@@ -1,11 +1,14 @@
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
+use clap::CommandFactory;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, shells};
+use mole_linux::core::fsutil::{atomic_replace, resolve_symlink_chain};
 use mole_linux::{scan, tui};
 
 #[derive(Debug, Parser)]
@@ -141,8 +144,12 @@ struct HistoryArgs {
 
 #[derive(Debug, Args)]
 struct CompletionArgs {
-    /// Shell to generate completions for
-    shell: Shell,
+    /// Shell to generate completions for (prints to stdout)
+    shell: Option<Shell>,
+    /// Remove the managed completion block from the detected shell config
+    #[arg(long, conflicts_with = "shell")]
+    remove: bool,
+    /// Preview an rc-file update or removal without writing
     #[arg(long)]
     dry_run: bool,
 }
@@ -187,8 +194,188 @@ fn run() -> io::Result<()> {
         Command::Uninstall(_) => not_implemented("uninstall", 34),
         Command::Optimize(_) => not_implemented("optimize", 39),
         Command::History(_) => not_implemented("history", 12),
-        Command::Completion(_) => not_implemented("completion", 41),
+        Command::Completion(args) => run_completion(args),
     }
+}
+
+const COMPLETION_START: &str = "# >>> mole-linux completion >>>";
+const COMPLETION_END: &str = "# <<< mole-linux completion <<<";
+
+fn run_completion(args: CompletionArgs) -> io::Result<()> {
+    if let Some(shell) = args.shell {
+        let mut command = Cli::command();
+        let mut completion = Vec::new();
+        match shell {
+            Shell::Bash => generate(shells::Bash, &mut command, "mole-linux", &mut completion),
+            Shell::Zsh => generate(shells::Zsh, &mut command, "mole-linux", &mut completion),
+            Shell::Fish => generate(shells::Fish, &mut command, "mole-linux", &mut completion),
+        }
+        if let Err(error) = io::stdout().lock().write_all(&completion) {
+            if error.kind() == io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                error.kind(),
+                format!("failed to write completion to stdout: {error}"),
+            ));
+        }
+        return Ok(());
+    }
+
+    let shell = detected_shell()?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    let rc_path = match shell {
+        Shell::Bash => {
+            let profile = home.join(".bash_profile");
+            match std::fs::symlink_metadata(&profile) {
+                Ok(_) => profile,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => home.join(".bashrc"),
+                Err(error) => return Err(error),
+            }
+        }
+        Shell::Zsh => home.join(".zshrc"),
+        Shell::Fish => home.join(".config/fish/config.fish"),
+    };
+    let rc_path = resolve_symlink_chain(&rc_path)?;
+    let existing = match std::fs::read_to_string(&rc_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let updated = replace_completion_block(&existing, shell, args.remove)?;
+
+    if args.dry_run {
+        print!("{}", completion_diff(&rc_path, &existing, &updated));
+        return Ok(());
+    }
+    if updated != existing {
+        if let Some(parent) = rc_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        atomic_replace(&rc_path, updated.as_bytes())?;
+    }
+    println!("Updated {rc_path:?}");
+    Ok(())
+}
+
+fn completion_diff(path: &std::path::Path, before: &str, after: &str) -> String {
+    let before_lines: Vec<&str> = before.split_inclusive('\n').collect();
+    let after_lines: Vec<&str> = after.split_inclusive('\n').collect();
+    let mut prefix = 0;
+    while prefix < before_lines.len()
+        && prefix < after_lines.len()
+        && before_lines[prefix] == after_lines[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < before_lines.len() - prefix
+        && suffix < after_lines.len() - prefix
+        && before_lines[before_lines.len() - suffix - 1]
+            == after_lines[after_lines.len() - suffix - 1]
+    {
+        suffix += 1;
+    }
+
+    let mut diff = format!("Would update {path:?}\n");
+    for line in &before_lines[prefix..before_lines.len() - suffix] {
+        diff.push('-');
+        diff.push_str(line);
+        if !line.ends_with('\n') {
+            diff.push('\n');
+        }
+    }
+    for line in &after_lines[prefix..after_lines.len() - suffix] {
+        diff.push('+');
+        diff.push_str(line);
+        if !line.ends_with('\n') {
+            diff.push('\n');
+        }
+    }
+    if prefix == before_lines.len() && prefix == after_lines.len() {
+        diff.push_str("(no changes)\n");
+    }
+    diff
+}
+
+fn detected_shell() -> io::Result<Shell> {
+    let name = std::env::var("SHELL")
+        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "SHELL is not set"))?;
+    match std::path::Path::new(&name)
+        .file_name()
+        .and_then(|name| name.to_str())
+    {
+        Some("bash") => Ok(Shell::Bash),
+        Some("zsh") => Ok(Shell::Zsh),
+        Some("fish") => Ok(Shell::Fish),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported shell in SHELL: {name}"),
+        )),
+    }
+}
+
+// Ported from tw93/Mole bin/completion.sh auto-install path (GPL-3.0): preserve unrelated rc lines and manage only our marked block.
+fn replace_completion_block(existing: &str, shell: Shell, remove: bool) -> io::Result<String> {
+    let mut output = String::with_capacity(existing.len());
+    let mut in_block = false;
+    for line in existing.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed == COMPLETION_START {
+            if in_block {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "nested completion markers",
+                ));
+            }
+            in_block = true;
+            continue;
+        }
+        if trimmed == COMPLETION_END {
+            if !in_block {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "completion end marker without start",
+                ));
+            }
+            in_block = false;
+            continue;
+        }
+        if !in_block {
+            output.push_str(line);
+        }
+    }
+    if in_block {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unterminated completion markers",
+        ));
+    }
+    if remove {
+        return Ok(output);
+    }
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(COMPLETION_START);
+    output.push('\n');
+    match shell {
+        Shell::Bash | Shell::Zsh => {
+            output.push_str("eval \"$(mole-linux completion ");
+            output.push_str(if matches!(shell, Shell::Bash) {
+                "bash"
+            } else {
+                "zsh"
+            });
+            output.push_str(" 2>/dev/null)\"\n");
+        }
+        Shell::Fish => output.push_str("mole-linux completion fish | source\n"),
+    }
+    output.push_str(COMPLETION_END);
+    output.push('\n');
+    Ok(output)
 }
 
 fn not_implemented(command: &str, issue: u32) -> io::Result<()> {

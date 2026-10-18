@@ -3,7 +3,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use mole_linux::core::paths::XdgPaths;
-use mole_linux::core::sink::{DeleteMode, Identity, delete, delete_batch};
+use mole_linux::core::sink::{DeleteError, DeleteMode, Identity, delete, delete_batch};
 
 fn xdg(home: &Path) -> XdgPaths {
     XdgPaths::from_values(home.to_path_buf(), None, None, None, None)
@@ -187,4 +187,209 @@ fn permanent_directory_removal_is_fd_relative_and_recursive() {
     )
     .expect("remove tree");
     assert!(!target.exists());
+}
+
+#[test]
+fn ancestor_symlink_swap_after_preview_refuses_decoy() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(home.join("ancestor/nested")).expect("source ancestor");
+    let target = home.join("ancestor/nested/item");
+    fs::write(&target, "approved").expect("preview target");
+    let preview = identity(&target);
+    let decoy = home.join("decoy/nested");
+    fs::create_dir_all(&decoy).expect("decoy dirs");
+    fs::write(decoy.join("item"), "decoy survives").expect("decoy target");
+    fs::rename(home.join("ancestor"), home.join("moved")).expect("move original ancestor");
+    std::os::unix::fs::symlink(home.join("decoy"), home.join("ancestor"))
+        .expect("swap ancestor for symlink");
+
+    let result = delete(&target, &preview, DeleteMode::Permanent, &home, &xdg(&home));
+    assert!(result.is_err());
+    assert_eq!(
+        fs::read(decoy.join("item")).expect("decoy remains"),
+        b"decoy survives"
+    );
+}
+
+#[test]
+fn sink_rejects_ssh_key_and_git_metadata() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(home.join(".ssh")).expect("ssh dir");
+    fs::create_dir_all(home.join("repo/.git")).expect("repo metadata");
+    let key = home.join(".ssh/id_x");
+    let git = home.join("repo/.git");
+    fs::write(&key, "key").expect("key");
+    fs::write(git.join("config"), "repo").expect("git config");
+
+    for target in [&key, &git] {
+        let result = delete(
+            target,
+            &identity(target),
+            DeleteMode::Permanent,
+            &home,
+            &xdg(&home),
+        );
+        assert!(
+            matches!(result, Err(DeleteError::InvalidPath(_))),
+            "{target:?} must be rejected"
+        );
+    }
+    assert_eq!(fs::read(&key).expect("key untouched"), b"key");
+    assert_eq!(
+        fs::read(git.join("config")).expect("git untouched"),
+        b"repo"
+    );
+}
+
+#[test]
+fn trash_directory_symlink_hijack_refuses_without_moving_target() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let elsewhere = temp.path().join("elsewhere");
+    fs::create_dir_all(home.join(".local/share")).expect("xdg share");
+    fs::create_dir(&elsewhere).expect("hijack destination");
+    std::os::unix::fs::symlink(&elsewhere, home.join(".local/share/Trash"))
+        .expect("Trash hijack symlink");
+    let target = home.join("item");
+    fs::write(&target, "keep").expect("target");
+
+    let result = delete(
+        &target,
+        &identity(&target),
+        DeleteMode::Trash,
+        &home,
+        &xdg(&home),
+    );
+    assert!(result.is_err());
+    assert_eq!(fs::read(&target).expect("source stays"), b"keep");
+    assert!(
+        fs::read_dir(elsewhere)
+            .expect("hijack destination intact")
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn same_basename_trash_items_get_distinct_names_and_correct_metadata() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(home.join("one")).expect("one");
+    fs::create_dir_all(home.join("two")).expect("two");
+    let first = home.join("one/shared.txt");
+    let second = home.join("two/shared.txt");
+    fs::write(&first, "first").expect("first item");
+    fs::write(&second, "second").expect("second item");
+
+    let first_trash = delete(
+        &first,
+        &identity(&first),
+        DeleteMode::Trash,
+        &home,
+        &xdg(&home),
+    )
+    .expect("first trash");
+    let second_trash = delete(
+        &second,
+        &identity(&second),
+        DeleteMode::Trash,
+        &home,
+        &xdg(&home),
+    )
+    .expect("second trash");
+    assert_ne!(first_trash.file_name(), second_trash.file_name());
+    let info_dir = home.join(".local/share/Trash/info");
+    for (trashed, original) in [(&first_trash, &first), (&second_trash, &second)] {
+        let mut info_name = trashed.file_name().expect("trash filename").to_os_string();
+        info_name.push(".trashinfo");
+        let contents = fs::read_to_string(info_dir.join(info_name)).expect("matching trashinfo");
+        assert!(contents.contains(&format!("Path={}", original.display())));
+    }
+}
+
+#[test]
+fn unreadable_parent_after_preview_refuses_delete() {
+    if rustix::process::getuid().as_raw() == 0 {
+        eprintln!("SKIP unreadable parent: running as root bypasses mode bits");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let parent = home.join("parent");
+    fs::create_dir_all(&parent).expect("parent");
+    let target = parent.join("item");
+    fs::write(&target, "keep").expect("target");
+    let preview = identity(&target);
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o0)).expect("make parent unreadable");
+
+    let result = delete(&target, &preview, DeleteMode::Permanent, &home, &xdg(&home));
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("restore parent");
+    assert!(result.is_err());
+    assert_eq!(fs::read(&target).expect("target remains"), b"keep");
+}
+
+#[test]
+fn nested_unwritable_directory_returns_partial_error_without_panicking() {
+    if rustix::process::getuid().as_raw() == 0 {
+        eprintln!("SKIP unwritable nested directory: running as root bypasses mode bits");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let tree = home.join("tree");
+    let blocked = tree.join("blocked");
+    fs::create_dir_all(&blocked).expect("nested directory");
+    fs::write(blocked.join("keep"), "keep").expect("nested payload");
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0))
+        .expect("make nested dir unreadable");
+
+    let result = delete(
+        &tree,
+        &identity(&tree),
+        DeleteMode::Permanent,
+        &home,
+        &xdg(&home),
+    );
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).expect("restore permissions");
+    let message = result
+        .expect_err("unreadable nested directory is refused")
+        .to_string();
+    assert!(
+        message.contains("partial"),
+        "partial result should be explicit: {message}"
+    );
+    assert_eq!(
+        fs::read(blocked.join("keep")).expect("nested payload preserved"),
+        b"keep"
+    );
+}
+
+#[test]
+fn cancellation_after_first_item_marks_only_remaining_items_cancelled() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir(&home).expect("home");
+    let first = home.join("first");
+    let second = home.join("second");
+    fs::write(&first, "first").expect("first");
+    fs::write(&second, "second").expect("second");
+    let entries = vec![
+        (first.clone(), identity(&first)),
+        (second.clone(), identity(&second)),
+    ];
+    let mut checks = 0;
+
+    let results = delete_batch(entries, DeleteMode::Permanent, &home, &xdg(&home), || {
+        checks += 1;
+        checks > 1
+    });
+    assert_eq!(results.len(), 2);
+    assert!(results[0].1.is_ok());
+    assert!(matches!(results[1].1, Err(DeleteError::Cancelled)));
+    assert!(!first.exists());
+    assert!(second.exists());
 }

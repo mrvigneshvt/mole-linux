@@ -53,7 +53,9 @@ pub enum DeleteError {
     InvalidPath(ValidationError),
     IdentityChanged,
     Cancelled,
+    Partial(io::Error),
     CrossFilesystemTrash,
+    TrashMetadataCleanup(io::Error),
     Io(io::Error),
 }
 
@@ -63,8 +65,12 @@ impl std::fmt::Display for DeleteError {
             Self::InvalidPath(error) => write!(f, "path rejected by deletion policy: {error:?}"),
             Self::IdentityChanged => f.write_str("target identity changed after preview; skipped"),
             Self::Cancelled => f.write_str("batch cancelled before this item"),
+            Self::Partial(error) => write!(f, "partial permanent removal: {error}"),
             Self::CrossFilesystemTrash => {
                 f.write_str("Trash is on another filesystem; refusing Trash move")
+            }
+            Self::TrashMetadataCleanup(error) => {
+                write!(f, "failed to remove Trash metadata: {error}")
             }
             Self::Io(error) => error.fmt(f),
         }
@@ -137,7 +143,8 @@ pub fn delete(
                 if opened.st_dev != expected.device || opened.st_ino != expected.inode {
                     return Err(DeleteError::IdentityChanged);
                 }
-                remove_tree(&target_fd, expected.device)?;
+                remove_tree(&target_fd, expected.device)
+                    .map_err(|error| DeleteError::Partial(io::Error::other(error.to_string())))?;
                 let rebound = rfs::statat(&parent_fd, name, AtFlags::SYMLINK_NOFOLLOW)
                     .map_err(io::Error::from)?;
                 if rebound.st_dev != expected.device
@@ -329,19 +336,33 @@ fn move_to_trash(
         let mut file = fs::File::from(info_file);
         use std::io::Write;
         if let Err(error) = file.write_all(contents.as_bytes()) {
-            let _ = rfs::unlinkat(&info_fd, &info_name, AtFlags::empty());
-            return Err(DeleteError::Io(error));
+            return Err(cleanup_trash_info(
+                &info_fd,
+                &info_name,
+                DeleteError::Io(error),
+            ));
         }
         drop(file);
-        let rebound =
-            rfs::statat(parent_fd, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+        let rebound = match rfs::statat(parent_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(error) => {
+                return Err(cleanup_trash_info(
+                    &info_fd,
+                    &info_name,
+                    DeleteError::Io(error.into()),
+                ));
+            }
+        };
         if rebound.st_dev != identity.device
             || rebound.st_ino != identity.inode
             || rebound.st_mtime != identity.mtime
             || rebound.st_mtime_nsec != identity.mtime_nsec
         {
-            let _ = rfs::unlinkat(&info_fd, &info_name, AtFlags::empty());
-            return Err(DeleteError::IdentityChanged);
+            return Err(cleanup_trash_info(
+                &info_fd,
+                &info_name,
+                DeleteError::IdentityChanged,
+            ));
         }
         match rfs::renameat_with(
             parent_fd,
@@ -352,11 +373,15 @@ fn move_to_trash(
         ) {
             Ok(()) => return Ok(trash.join("files").join(candidate)),
             Err(error) => {
-                let _ = rfs::unlinkat(&info_fd, &info_name, AtFlags::empty());
-                if error.raw_os_error() == rustix::io::Errno::EXIST.raw_os_error() {
+                let is_collision = error.raw_os_error() == rustix::io::Errno::EXIST.raw_os_error();
+                let error = cleanup_trash_info(&info_fd, &info_name, DeleteError::Io(error.into()));
+                if matches!(error, DeleteError::TrashMetadataCleanup(_)) {
+                    return Err(error);
+                }
+                if is_collision {
                     continue;
                 }
-                return Err(DeleteError::Io(error.into()));
+                return Err(error);
             }
         }
     }
@@ -364,6 +389,19 @@ fn move_to_trash(
         io::ErrorKind::AlreadyExists,
         "could not allocate collision-free Trash name",
     )))
+}
+
+fn cleanup_trash_info(
+    directory: &OwnedFd,
+    name: &std::ffi::OsStr,
+    original: DeleteError,
+) -> DeleteError {
+    match rfs::unlinkat(directory, name, AtFlags::empty()) {
+        Ok(()) => original,
+        Err(error) => DeleteError::TrashMetadataCleanup(io::Error::other(format!(
+            "{original}; failed to remove Trash metadata: {error}"
+        ))),
+    }
 }
 
 fn ensure_child_dir(parent: &OwnedFd, name: &str) -> io::Result<OwnedFd> {
@@ -417,6 +455,8 @@ fn percent_path(path: &Path) -> String {
 }
 
 fn utc_timestamp(seconds: u64) -> String {
+    // ponytail: Keep UTC timestamps without a timezone conversion dependency; upgrade to local
+    // time after an approved libc-based timezone conversion is available.
     let days = seconds / 86_400;
     let day_seconds = seconds % 86_400;
     let z = i128::from(days) + 719_468;

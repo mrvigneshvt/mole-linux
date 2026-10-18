@@ -1,2 +1,7 @@
 docs/agent-context/STATUS.md merge=union
 docs/agent-context/KNOWN-GAPS.md merge=union
+src/lib.rs merge=union
+src/core/mod.rs merge=union
+src/commands/mod.rs merge=union
+src/adapters/mod.rs merge=union
+src/rules/mod.rs merge=union

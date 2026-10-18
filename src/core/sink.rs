@@ -1,17 +1,86 @@
 // Ported from tw93/Mole lib/core/file_ops.sh:mole_delete (GPL-3.0)
 // and cmd/analyze/delete.go:deleteMultiplePathsCmd (GPL-3.0).
 use std::fs;
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{self as rfs, AtFlags, Mode as FileMode, OFlags, RenameFlags, StatxFlags};
 
 use super::paths::XdgPaths;
 use super::validate::{ValidationError, validate_path_for_deletion};
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically replaces a regular configuration file through the shared mutation boundary.
+pub fn atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "replacement path has no filename",
+        )
+    })?;
+    let existing_mode = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to replace a symbolic link directly",
+            ));
+        }
+        Ok(metadata) => Some(metadata.permissions().mode() & 0o7777),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+
+    let (temporary_path, mut temporary_file) = loop {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary_name = format!(".mole-linux-{}-{sequence}.tmp", std::process::id());
+        let candidate = parent.join(temporary_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o666)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    let operation = (|| {
+        if let Some(mode) = existing_mode {
+            temporary_file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
+        temporary_file.write_all(bytes)?;
+        temporary_file.sync_all()?;
+        drop(temporary_file);
+        fs::rename(&temporary_path, path)
+    })();
+
+    if let Err(error) = operation {
+        match fs::remove_file(&temporary_path) {
+            Ok(()) => {}
+            Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => {}
+            Err(cleanup_error) => {
+                return Err(io::Error::other(format!(
+                    "{error}; also failed to remove temporary file {temporary_path:?}: {cleanup_error}",
+                )));
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeleteMode {

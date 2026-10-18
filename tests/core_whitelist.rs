@@ -38,6 +38,35 @@ fn loads_patterns_from_xdg_mole_linux_whitelist_and_matches_globs() {
 }
 
 #[test]
+fn invalid_whitelist_lines_are_skipped_and_reported_with_line_numbers() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    let config = temp.path().join("config");
+    fs::create_dir_all(&home).expect("home");
+    let whitelist_path = config.join("mole-linux/whitelist");
+    fs::create_dir_all(whitelist_path.parent().expect("parent")).expect("config dir");
+    fs::write(
+        &whitelist_path,
+        "# ignored comment\nrelative/cache\n/home/test/../secret\n/home/test/bad\tname\n/home/test/[broken\n/home/test/keep\n",
+    )
+    .expect("write whitelist");
+
+    let whitelist = Whitelist::load(&xdg(&home, &config)).expect("load whitelist");
+
+    assert_eq!(whitelist.warnings.len(), 4);
+    assert_eq!(whitelist.warnings[0].line, 2);
+    assert_eq!(whitelist.warnings[0].reason, "relative path");
+    assert_eq!(whitelist.warnings[1].line, 3);
+    assert_eq!(whitelist.warnings[1].reason, "path traversal");
+    assert_eq!(whitelist.warnings[2].line, 4);
+    assert_eq!(whitelist.warnings[2].reason, "control character");
+    assert_eq!(whitelist.warnings[3].line, 5);
+    assert_eq!(whitelist.warnings[3].reason, "invalid glob pattern");
+    assert!(whitelist.is_whitelisted(Path::new("/home/test/keep")));
+    assert!(!whitelist.is_whitelisted(Path::new("/home/test/nope")));
+}
+
+#[test]
 fn normalizes_repeated_slashes_and_preserves_literal_pattern_descendants() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let home = temp.path().join("home");
@@ -74,6 +103,44 @@ fn saves_unique_patterns_at_the_xdg_path() {
         fs::read_to_string(config.join("mole-linux/whitelist")).expect("read saved file");
     assert_eq!(contents.matches("/home/test/cache/*").count(), 1);
     assert!(contents.starts_with("# Mole Linux Whitelist"));
+}
+
+#[cfg(unix)]
+#[test]
+fn saving_replaces_file_atomically_and_preserves_config_symlink() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    let config = temp.path().join("config");
+    let external = temp.path().join("linked-whitelist");
+    fs::create_dir_all(&home).expect("home");
+    let whitelist_path = config.join("mole-linux/whitelist");
+    fs::create_dir_all(whitelist_path.parent().expect("parent")).expect("config dir");
+    fs::write(&external, "# old\n").expect("initial target");
+    std::os::unix::fs::symlink(&external, &whitelist_path).expect("whitelist symlink");
+    let original_inode = fs::metadata(&external).expect("target metadata").ino();
+
+    Whitelist::save_patterns(&xdg(&home, &config), &["/home/test/keep".to_owned()])
+        .expect("save through symlink");
+
+    assert!(
+        fs::symlink_metadata(&whitelist_path)
+            .expect("symlink metadata")
+            .file_type()
+            .is_symlink()
+    );
+    assert_ne!(
+        fs::metadata(&external)
+            .expect("updated target metadata")
+            .ino(),
+        original_inode
+    );
+    assert!(
+        fs::read_to_string(&external)
+            .expect("read target")
+            .contains("/home/test/keep")
+    );
 }
 
 #[cfg(unix)]

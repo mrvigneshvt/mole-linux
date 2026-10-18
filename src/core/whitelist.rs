@@ -4,12 +4,20 @@ use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobMatcher};
 
+use super::fsutil::{atomic_replace, resolve_symlink_chain};
 use super::paths::XdgPaths;
 
 /// User configured paths that must be kept by every deletion policy check.
 #[derive(Debug)]
 pub struct Whitelist {
     patterns: Vec<Pattern>,
+    pub warnings: Vec<WhitelistWarning>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WhitelistWarning {
+    pub line: usize,
+    pub reason: String,
 }
 
 #[derive(Debug)]
@@ -22,7 +30,6 @@ struct Pattern {
 #[derive(Debug)]
 pub enum WhitelistError {
     Io(io::Error),
-    InvalidPattern { line: usize },
 }
 
 impl Whitelist {
@@ -36,27 +43,46 @@ impl Whitelist {
             Err(error) => return Err(WhitelistError::Io(error)),
         };
         let mut patterns = Vec::new();
+        let mut warnings = Vec::new();
         for (index, raw) in contents.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             let expanded = expand_home(line, &xdg.home);
-            if !expanded.starts_with('/')
-                || expanded.contains("..")
-                || expanded.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
-            {
+            let invalid_reason = if !expanded.starts_with('/') {
+                Some("relative path")
+            } else if expanded.contains("..") {
+                Some("path traversal")
+            } else if expanded.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+                Some("control character")
+            } else {
+                None
+            };
+            if let Some(reason) = invalid_reason {
+                warnings.push(WhitelistWarning {
+                    line: index + 1,
+                    reason: reason.to_owned(),
+                });
                 continue;
             }
             let normalized = normalize_slashes(&expanded);
             let has_glob =
                 normalized.contains('*') || normalized.contains('?') || normalized.contains('[');
-            let matcher = GlobBuilder::new(&normalized)
+            let matcher = match GlobBuilder::new(&normalized)
                 .literal_separator(true)
                 .backslash_escape(false)
                 .build()
-                .map_err(|_| WhitelistError::InvalidPattern { line: index + 1 })?
-                .compile_matcher();
+            {
+                Ok(glob) => glob.compile_matcher(),
+                Err(_) => {
+                    warnings.push(WhitelistWarning {
+                        line: index + 1,
+                        reason: "invalid glob pattern".to_owned(),
+                    });
+                    continue;
+                }
+            };
             if !patterns
                 .iter()
                 .any(|pattern: &Pattern| pattern.source == normalized)
@@ -68,11 +94,12 @@ impl Whitelist {
                 });
             }
         }
-        Ok(Self { patterns })
+        Ok(Self { patterns, warnings })
     }
 
     /// Return whether a path or a containing directory must be preserved.
-    pub fn matches(&self, path: &Path) -> bool {
+    /// The deletion sink checks this policy before removing a path.
+    pub fn is_whitelisted(&self, path: &Path) -> bool {
         // Ported from tw93/Mole lib/core/app_protection.sh:is_path_whitelisted (GPL-3.0).
         let Some(target) = path.to_str().map(normalize_slashes) else {
             return self
@@ -87,6 +114,10 @@ impl Whitelist {
                 || pattern.source.starts_with(&format!("{target}/"))
                 || (!pattern.has_glob && target.starts_with(&format!("{}/", pattern.source)))
         })
+    }
+
+    pub fn matches(&self, path: &Path) -> bool {
+        self.is_whitelisted(path)
     }
 
     pub fn path(xdg: &XdgPaths) -> PathBuf {
@@ -117,7 +148,8 @@ impl Whitelist {
             contents.push_str(&pattern);
             contents.push('\n');
         }
-        fs::write(path, contents).map_err(WhitelistError::Io)
+        let resolved_path = resolve_symlink_chain(&path).map_err(WhitelistError::Io)?;
+        atomic_replace(&resolved_path, contents.as_bytes()).map_err(WhitelistError::Io)
     }
 }
 

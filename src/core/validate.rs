@@ -163,7 +163,7 @@ fn check_policy(path: &Path, home: &Path, xdg: &XdgPaths) -> Result<(), Validati
     }
     let whitelist =
         Whitelist::load(xdg).map_err(|_| ValidationError::Unverifiable(Whitelist::path(xdg)))?;
-    if whitelist.matches(&normalized) {
+    if whitelist.is_whitelisted(&normalized) {
         return Err(ValidationError::Protected(normalized));
     }
     Ok(())

@@ -291,12 +291,20 @@ fn status_json_emits_a_snapshot() {
 }
 
 #[test]
-fn analyze_json_is_explicitly_unimplemented() {
-    let output = run(&["analyze", "--json"]);
-    assert_eq!(output.status.code(), Some(2));
+fn analyze_json_emits_a_document_instead_of_the_unimplemented_error() {
+    let dir = tempdir().expect("temporary scan root");
+    let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
+        .args(["analyze", "--json"])
+        .arg(dir.path())
+        .output()
+        .expect("run analyze JSON");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("JSON output is not implemented yet (#7)")
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(document["scan_status"], "complete");
 }
 
 #[test]

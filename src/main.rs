@@ -9,7 +9,7 @@ use clap::CommandFactory;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, shells};
 use mole_linux::core::fsutil::{atomic_replace, resolve_symlink_chain};
-use mole_linux::{scan, tui};
+use mole_linux::{scan, status, tui};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -187,7 +187,7 @@ fn run() -> io::Result<()> {
             let path = args.path.unwrap_or_else(|| PathBuf::from("."));
             run_analyzer(path)
         }
-        Command::Status(_) => not_implemented("status", 37),
+        Command::Status(args) => run_status(args),
         Command::Clean(_) => not_implemented("clean", 16),
         Command::Purge(_) => not_implemented("purge", 31),
         Command::Installer(_) => not_implemented("installer", 33),
@@ -376,6 +376,69 @@ fn replace_completion_block(existing: &str, shell: Shell, remove: bool) -> io::R
     output.push_str(COMPLETION_END);
     output.push('\n');
     Ok(output)
+}
+
+fn run_status(args: StatusArgs) -> io::Result<()> {
+    if args.watch {
+        let interval = args.interval.max(1);
+        let mut tracker = status::StatusTracker::default();
+        loop {
+            let mut snapshot = status::collect();
+            tracker.update(&mut snapshot, std::time::Instant::now());
+            print_snapshot(&snapshot, true)?;
+            std::thread::sleep(std::time::Duration::from_secs(interval));
+        }
+    }
+    let snapshot = status::collect();
+    print_snapshot(&snapshot, args.json)
+}
+
+fn print_snapshot(snapshot: &status::Snapshot, json: bool) -> io::Result<()> {
+    if json {
+        serde_json::to_writer(io::stdout().lock(), &snapshot).map_err(io::Error::other)?;
+        println!();
+    } else {
+        let mut out = io::stdout().lock();
+        writeln!(out, "System status")?;
+        writeln!(
+            out,
+            "CPU: {:?} ({} cores)",
+            snapshot.cpu.availability,
+            snapshot
+                .cpu
+                .logical_cores
+                .map_or_else(|| "unknown".to_owned(), |n| n.to_string())
+        )?;
+        writeln!(
+            out,
+            "Load: {} / {} / {}",
+            display(snapshot.load.one),
+            display(snapshot.load.five),
+            display(snapshot.load.fifteen)
+        )?;
+        writeln!(
+            out,
+            "Memory: {} / {} kB",
+            display(snapshot.memory.used_kb),
+            display(snapshot.memory.total_kb)
+        )?;
+        writeln!(
+            out,
+            "Swap: {} / {} kB",
+            display(snapshot.memory.swap_used_kb),
+            display(snapshot.memory.swap_total_kb)
+        )?;
+        writeln!(
+            out,
+            "Processes: {} zombies",
+            display(snapshot.processes.zombies)
+        )?;
+    }
+    Ok(())
+}
+
+fn display<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
 }
 
 fn not_implemented(command: &str, issue: u32) -> io::Result<()> {

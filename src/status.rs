@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -34,6 +34,8 @@ pub struct Cpu {
     pub availability: Availability,
     pub logical_cores: Option<usize>,
     pub total_ticks: Option<u64>,
+    pub idle_ticks: Option<u64>,
+    pub usage_percent: Option<f64>,
     pub per_core_ticks: Vec<CoreTicks>,
 }
 #[derive(Debug, Serialize)]
@@ -41,6 +43,7 @@ pub struct CoreTicks {
     pub name: String,
     pub total: u64,
     pub idle: u64,
+    pub usage_percent: Option<f64>,
 }
 #[derive(Debug, Serialize)]
 pub struct Memory {
@@ -73,6 +76,8 @@ pub struct Interface {
     pub name: String,
     pub received_bytes: Option<u64>,
     pub transmitted_bytes: Option<u64>,
+    pub rx_bytes_per_sec: Option<u64>,
+    pub tx_bytes_per_sec: Option<u64>,
 }
 #[derive(Debug, Serialize)]
 pub struct DiskIo {
@@ -99,6 +104,10 @@ pub struct DeviceIo {
     pub name: String,
     pub reads: u64,
     pub writes: u64,
+    pub read_bytes: Option<u64>,
+    pub write_bytes: Option<u64>,
+    pub read_bytes_per_sec: Option<u64>,
+    pub write_bytes_per_sec: Option<u64>,
 }
 #[derive(Debug, Serialize)]
 pub struct Processes {
@@ -112,6 +121,7 @@ pub struct Process {
     pub command: String,
     pub state: char,
     pub cpu_ticks: u64,
+    pub cpu_percent: Option<f64>,
 }
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct HighCpuAlert {
@@ -130,6 +140,194 @@ struct ProcessWindow {
 pub struct StatusTracker {
     previous_total: Option<u64>,
     previous: HashMap<u32, ProcessWindow>,
+}
+
+#[derive(Debug)]
+pub struct Collector {
+    proc_root: PathBuf,
+    sys_root: PathBuf,
+    previous: Option<CounterSample>,
+    tracker: StatusTracker,
+}
+
+#[derive(Debug)]
+struct CounterSample {
+    collected_at: Instant,
+    cpu_total: Option<u64>,
+    cpu_idle: Option<u64>,
+    cores: HashMap<String, (u64, u64)>,
+    disks: HashMap<String, (Option<u64>, Option<u64>)>,
+    network: HashMap<String, (Option<u64>, Option<u64>)>,
+    processes: HashMap<u32, (u32, String, u64)>,
+}
+
+impl Collector {
+    pub fn system() -> Self {
+        Self::new(Path::new("/proc"), Path::new("/sys"))
+    }
+
+    pub fn new(proc_root: &Path, sys_root: &Path) -> Self {
+        Self {
+            proc_root: proc_root.to_owned(),
+            sys_root: sys_root.to_owned(),
+            previous: None,
+            tracker: StatusTracker::default(),
+        }
+    }
+
+    pub fn collect(&mut self) -> Snapshot {
+        self.collect_at(Instant::now())
+    }
+
+    pub fn collect_at(&mut self, now: Instant) -> Snapshot {
+        // Ported from tw93/Mole cmd/status/metrics.go:NewCollector (GPL-3.0): keep one collector's samples warm across frames.
+        let mut snapshot = collect_snapshot(&self.proc_root, &self.sys_root, true);
+        let current = CounterSample::from_snapshot(&snapshot, now);
+        if let Some(previous) = &self.previous {
+            apply_rates(previous, &mut snapshot, now);
+        }
+        self.tracker.update(&mut snapshot, now);
+        self.previous = Some(current);
+        snapshot
+    }
+}
+
+impl CounterSample {
+    fn from_snapshot(snapshot: &Snapshot, collected_at: Instant) -> Self {
+        Self {
+            collected_at,
+            cpu_total: snapshot.cpu.total_ticks,
+            cpu_idle: snapshot.cpu.idle_ticks,
+            cores: snapshot
+                .cpu
+                .per_core_ticks
+                .iter()
+                .map(|core| (core.name.clone(), (core.total, core.idle)))
+                .collect(),
+            disks: snapshot
+                .disk_io
+                .devices
+                .iter()
+                .map(|device| (device.name.clone(), (device.read_bytes, device.write_bytes)))
+                .collect(),
+            network: snapshot
+                .network
+                .interfaces
+                .iter()
+                .map(|interface| {
+                    (
+                        interface.name.clone(),
+                        (interface.received_bytes, interface.transmitted_bytes),
+                    )
+                })
+                .collect(),
+            processes: snapshot
+                .processes
+                .top
+                .iter()
+                .map(|process| {
+                    (
+                        process.pid,
+                        (process.ppid, process.command.clone(), process.cpu_ticks),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl Default for Collector {
+    fn default() -> Self {
+        Self::system()
+    }
+}
+
+fn apply_rates(previous: &CounterSample, snapshot: &mut Snapshot, now: Instant) {
+    // Linux counter-delta adaptation of tw93/Mole cmd/status/metrics_disk.go:collectDiskIO and metrics_network.go:collectNetwork (GPL-3.0).
+    let elapsed = now.saturating_duration_since(previous.collected_at);
+    let total_delta = snapshot
+        .cpu
+        .total_ticks
+        .zip(previous.cpu_total)
+        .and_then(|(current, old)| current.checked_sub(old));
+    let idle_delta = snapshot
+        .cpu
+        .idle_ticks
+        .zip(previous.cpu_idle)
+        .and_then(|(current, old)| current.checked_sub(old));
+    snapshot.cpu.usage_percent = total_delta
+        .zip(idle_delta)
+        .and_then(|(total, idle)| total.checked_sub(idle).map(|busy| percent(busy, total, 1)))
+        .flatten();
+    for core in &mut snapshot.cpu.per_core_ticks {
+        core.usage_percent = previous
+            .cores
+            .get(&core.name)
+            .and_then(|(old_total, old_idle)| {
+                core.total
+                    .checked_sub(*old_total)
+                    .zip(core.idle.checked_sub(*old_idle))
+            })
+            .and_then(|(total, idle)| total.checked_sub(idle).map(|busy| percent(busy, total, 1)))
+            .flatten();
+    }
+    for device in &mut snapshot.disk_io.devices {
+        if let Some((old_read, old_write)) = previous.disks.get(&device.name) {
+            device.read_bytes_per_sec = byte_rate(*old_read, device.read_bytes, elapsed);
+            device.write_bytes_per_sec = byte_rate(*old_write, device.write_bytes, elapsed);
+        }
+    }
+    for interface in &mut snapshot.network.interfaces {
+        if let Some((old_rx, old_tx)) = previous.network.get(&interface.name) {
+            interface.rx_bytes_per_sec = byte_rate(*old_rx, interface.received_bytes, elapsed);
+            interface.tx_bytes_per_sec = byte_rate(*old_tx, interface.transmitted_bytes, elapsed);
+        }
+    }
+    let cores = snapshot
+        .cpu
+        .logical_cores
+        .and_then(|count| u64::try_from(count).ok());
+    for process in &mut snapshot.processes.top {
+        process.cpu_percent = previous
+            .processes
+            .get(&process.pid)
+            .filter(|(ppid, command, _)| *ppid == process.ppid && *command == process.command)
+            .and_then(|(_, _, old_ticks)| process.cpu_ticks.checked_sub(*old_ticks))
+            .zip(total_delta)
+            .and_then(|(used, total)| percent(used, total, cores?));
+    }
+    snapshot.processes.top.sort_by(|left, right| {
+        right
+            .cpu_percent
+            .unwrap_or(-1.0)
+            .total_cmp(&left.cpu_percent.unwrap_or(-1.0))
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+    snapshot.processes.top.truncate(10);
+}
+
+fn percent(numerator: u64, denominator: u64, multiplier: u64) -> Option<f64> {
+    if denominator == 0 {
+        return None;
+    }
+    let basis_points = numerator
+        .checked_mul(multiplier)?
+        .checked_mul(10_000)?
+        .checked_div(denominator)?;
+    Some(f64::from(u32::try_from(basis_points).ok()?) / 100.0)
+}
+
+fn byte_rate(previous: Option<u64>, current: Option<u64>, elapsed: Duration) -> Option<u64> {
+    let delta = current?.checked_sub(previous?)?;
+    let nanos = elapsed.as_nanos();
+    if nanos == 0 {
+        return None;
+    }
+    u128::from(delta)
+        .checked_mul(1_000_000_000)?
+        .checked_div(nanos)?
+        .try_into()
+        .ok()
 }
 impl StatusTracker {
     pub fn update(&mut self, snapshot: &mut Snapshot, now: Instant) {
@@ -201,11 +399,15 @@ pub struct Thermal {
 }
 
 pub fn collect() -> Snapshot {
-    collect_from(Path::new("/proc"), Path::new("/sys"))
+    Collector::system().collect()
 }
 
 // Ported from tw93/Mole lib/check/health_json.sh:get_memory_info (GPL-3.0), using Linux meminfo units.
 pub fn collect_from(proc_root: &Path, sys_root: &Path) -> Snapshot {
+    Collector::new(proc_root, sys_root).collect()
+}
+
+fn collect_snapshot(proc_root: &Path, sys_root: &Path, keep_all_processes: bool) -> Snapshot {
     let stat = read(proc_root, "stat");
     let (cpu, zombies) = parse_stat(&stat);
     let memory = parse_meminfo(&read(proc_root, "meminfo"));
@@ -216,7 +418,7 @@ pub fn collect_from(proc_root: &Path, sys_root: &Path) -> Snapshot {
     let network = parse_network(&read(proc_root, "net/dev"));
     let disk_io = parse_diskstats(&read(proc_root, "diskstats"));
     let disks = collect_disks(proc_root);
-    let processes = scan_processes(proc_root, zombies);
+    let processes = scan_processes(proc_root, zombies, keep_all_processes);
     Snapshot {
         cpu,
         memory,
@@ -240,28 +442,43 @@ fn read(root: &Path, name: &str) -> String {
 fn parse_stat(raw: &str) -> (Cpu, Option<usize>) {
     let mut cores = Vec::new();
     let mut total = None;
+    let mut idle_total = None;
     let mut zombie_count = None;
     for line in raw.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
         if fields.first() == Some(&"cpu") {
-            total = fields
+            let values = fields
                 .iter()
                 .skip(1)
-                .filter_map(|v| v.parse::<u64>().ok())
-                .try_fold(0u64, u64::checked_add);
+                .map(|value| value.parse::<u64>().ok())
+                .collect::<Option<Vec<_>>>();
+            total = values
+                .as_ref()
+                .and_then(|values| values.iter().copied().try_fold(0u64, u64::checked_add));
+            idle_total = values.as_ref().and_then(|values| {
+                values
+                    .get(3)
+                    .copied()
+                    .zip(values.get(4).copied().or(Some(0)))
+                    .and_then(|(idle, wait)| idle.checked_add(wait))
+            });
         } else if fields
             .first()
             .is_some_and(|v| v.starts_with("cpu") && v[3..].parse::<usize>().is_ok())
         {
             if fields.len() >= 5 {
-                let vals: Vec<u64> = fields[1..].iter().filter_map(|v| v.parse().ok()).collect();
-                if vals.len() >= 4 {
+                let vals = fields[1..]
+                    .iter()
+                    .map(|value| value.parse::<u64>().ok())
+                    .collect::<Option<Vec<_>>>();
+                if let Some(vals) = vals.filter(|values| values.len() >= 4) {
                     let sum = vals.iter().copied().try_fold(0u64, u64::checked_add);
                     if let Some(total) = sum {
                         cores.push(CoreTicks {
                             name: fields[0].to_owned(),
                             total,
                             idle: vals[3].saturating_add(*vals.get(4).unwrap_or(&0)),
+                            usage_percent: None,
                         });
                     }
                 }
@@ -285,6 +502,8 @@ fn parse_stat(raw: &str) -> (Cpu, Option<usize>) {
                 Some(cores.len())
             },
             total_ticks: total,
+            idle_ticks: idle_total,
+            usage_percent: None,
             per_core_ticks: cores,
         },
         zombies,
@@ -361,9 +580,11 @@ fn parse_network(raw: &str) -> Network {
             let f: Vec<_> = data.split_whitespace().collect();
             if f.len() >= 9 {
                 interfaces.push(Interface {
-                    name: name.trim().to_owned(),
+                    name: escape_controls(name.trim()),
                     received_bytes: f[0].parse().ok(),
                     transmitted_bytes: f[8].parse().ok(),
+                    rx_bytes_per_sec: None,
+                    tx_bytes_per_sec: None,
                 });
             }
         }
@@ -383,12 +604,21 @@ fn parse_diskstats(raw: &str) -> DiskIo {
     for line in raw.lines() {
         let f: Vec<_> = line.split_whitespace().collect();
         if f.len() >= 14
-            && let (Ok(reads), Ok(writes)) = (f[3].parse(), f[7].parse())
+            && let (Ok(reads), Ok(writes), Ok(read_sectors), Ok(write_sectors)) = (
+                f[3].parse(),
+                f[7].parse(),
+                f[5].parse::<u64>(),
+                f[9].parse::<u64>(),
+            )
         {
             devices.push(DeviceIo {
-                name: f[2].to_owned(),
+                name: escape_controls(f[2]),
                 reads,
                 writes,
+                read_bytes: read_sectors.checked_mul(512),
+                write_bytes: write_sectors.checked_mul(512),
+                read_bytes_per_sec: None,
+                write_bytes_per_sec: None,
             });
         }
     }
@@ -517,7 +747,7 @@ fn decode_mount_field(value: &str) -> String {
     }
     String::from_utf8_lossy(&out).into_owned()
 }
-fn scan_processes(root: &Path, stat_zombies: Option<usize>) -> Processes {
+fn scan_processes(root: &Path, stat_zombies: Option<usize>, keep_all: bool) -> Processes {
     let mut found = Vec::new();
     let mut zombies = 0usize;
     let mut complete = true;
@@ -563,7 +793,9 @@ fn scan_processes(root: &Path, stat_zombies: Option<usize>) -> Processes {
         }
     }
     found.sort_by_key(|p| std::cmp::Reverse(p.cpu_ticks));
-    found.truncate(10);
+    if !keep_all {
+        found.truncate(10);
+    }
     Processes {
         zombies: stat_zombies.or_else(|| complete.then_some(zombies)),
         top: found,
@@ -598,6 +830,7 @@ fn parse_process(pid: u32, raw: &str, root: &Path) -> Option<Process> {
         command: escape_controls(&cmd),
         state,
         cpu_ticks,
+        cpu_percent: None,
     })
 }
 
@@ -619,10 +852,10 @@ fn collect_batteries(root: &Path) -> Vec<Battery> {
             if read(&d, "type").trim() != "Battery" {
                 continue;
             }
-            let name = e.file_name().to_string_lossy().into_owned();
+            let name = escape_controls(&e.file_name().to_string_lossy());
             let status = fs::read_to_string(d.join("status"))
                 .ok()
-                .map(|v| v.trim().to_owned());
+                .map(|v| escape_controls(v.trim()));
             let cap = fs::read_to_string(d.join("capacity"))
                 .ok()
                 .and_then(|v| v.trim().parse().ok());
@@ -654,7 +887,7 @@ fn collect_thermal(root: &Path) -> Vec<Thermal> {
                 .ok()
                 .and_then(|v| v.trim().parse().ok());
             out.push(Thermal {
-                name,
+                name: escape_controls(&name),
                 sensor_type,
                 millicelsius: temp,
             });

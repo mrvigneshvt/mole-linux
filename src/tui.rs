@@ -1042,42 +1042,21 @@ pub fn run(
     terminal_guard.restore()
 }
 
-pub fn run_status() -> io::Result<()> {
+pub fn run_status(mut collector: status::Collector, interval: Duration) -> io::Result<()> {
     install_panic_restore_hook();
     let _terminal_guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
-    let mut tracker = status::StatusTracker::default();
     loop {
-        let mut snapshot = status::collect();
-        tracker.update(&mut snapshot, std::time::Instant::now());
-        terminal.draw(|frame| {
-            let area = frame.area();
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(1)])
-                .split(area);
-            frame.render_widget(
-                Paragraph::new(status::text_report(&snapshot)).block(
-                    Block::default()
-                        .title(" System Status ")
-                        .borders(Borders::ALL),
-                ),
-                chunks[0],
-            );
-            frame.render_widget(
-                Paragraph::new(" q / Esc quit  •  refreshes every second "),
-                chunks[1],
-            );
-        })?;
-
-        let last_refresh = std::time::Instant::now();
+        let snapshot = collector.collect();
+        let collected_at = std::time::Instant::now();
+        terminal.draw(|frame| render_status_dashboard(frame, &snapshot, interval))?;
         loop {
-            let elapsed = last_refresh.elapsed();
-            if elapsed >= Duration::from_secs(1) {
+            let elapsed = collected_at.elapsed();
+            if elapsed >= interval {
                 break;
             }
-            let remaining = Duration::from_secs(1).saturating_sub(elapsed);
+            let remaining = interval.saturating_sub(elapsed);
             if event::poll(remaining.min(Duration::from_millis(100)))? {
                 let Event::Key(key) = event::read()? else {
                     continue;
@@ -1094,6 +1073,241 @@ pub fn run_status() -> io::Result<()> {
                 }
             }
         }
+    }
+}
+
+fn render_status_dashboard(frame: &mut Frame<'_>, snapshot: &status::Snapshot, interval: Duration) {
+    // Linux dashboard adaptation of tw93/Mole cmd/status/main.go:model.View and view.go card rendering (GPL-3.0).
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+    frame.render_widget(Paragraph::new("Mole Linux · System Status"), chunks[0]);
+    let first_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+    let second_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[2]);
+    let third_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(chunks[3]);
+
+    let mut cpu_lines = vec![Line::from(format!(
+        "Total {:>7} {}",
+        status_percent(snapshot.cpu.usage_percent),
+        status_cpu_bar(snapshot.cpu.usage_percent, 20)
+    ))];
+    for pair in snapshot.cpu.per_core_ticks.chunks(2) {
+        let rendered = pair
+            .iter()
+            .map(|core| {
+                format!(
+                    "{} {} {}",
+                    core.name,
+                    status_percent(core.usage_percent),
+                    status_cpu_bar(core.usage_percent, 8)
+                )
+            })
+            .collect::<Vec<_>>();
+        cpu_lines.push(Line::from(rendered.join("  ")));
+    }
+    render_status_panel(frame, first_row[0], "CPU", cpu_lines);
+
+    render_status_panel(
+        frame,
+        first_row[1],
+        "Memory / Swap / PSI",
+        vec![
+            Line::from(format!(
+                "Memory {} / {}",
+                status::format_kib_gib(snapshot.memory.used_kb),
+                status::format_kib_gib(snapshot.memory.total_kb)
+            )),
+            Line::from(format!(
+                "Swap   {} / {}",
+                status::format_kib_gib(snapshot.memory.swap_used_kb),
+                status::format_kib_gib(snapshot.memory.swap_total_kb)
+            )),
+            Line::from(format!(
+                "PSI CPU {}  Memory {}  I/O {}",
+                status_percent(snapshot.cpu_pressure.some_avg10),
+                status_percent(snapshot.memory_pressure.some_avg10),
+                status_percent(snapshot.io_pressure.some_avg10)
+            )),
+        ],
+    );
+
+    let mut disk_lines = Vec::new();
+    for disk in snapshot.disks.mounts.iter().take(2) {
+        disk_lines.push(Line::from(format!(
+            "{} {} / {}",
+            disk.mountpoint,
+            status::format_bytes_gb(disk.used_bytes),
+            status::format_bytes_gb(disk.total_bytes)
+        )));
+    }
+    for device in snapshot.disk_io.devices.iter().take(2) {
+        disk_lines.push(Line::from(format!(
+            "{} r {}  w {}",
+            device.name,
+            status_byte_rate(device.read_bytes_per_sec),
+            status_byte_rate(device.write_bytes_per_sec)
+        )));
+    }
+    if disk_lines.is_empty() {
+        disk_lines.push(Line::from("Disk data unavailable"));
+    }
+    render_status_panel(frame, second_row[0], "Disks / I/O", disk_lines);
+
+    let network_lines = snapshot
+        .network
+        .interfaces
+        .iter()
+        .take(4)
+        .map(|interface| {
+            Line::from(format!(
+                "{} ↓ {}  ↑ {}",
+                interface.name,
+                status_byte_rate(interface.rx_bytes_per_sec),
+                status_byte_rate(interface.tx_bytes_per_sec)
+            ))
+        })
+        .collect::<Vec<_>>();
+    render_status_panel(
+        frame,
+        second_row[1],
+        "Network",
+        if network_lines.is_empty() {
+            vec![Line::from("Network data unavailable")]
+        } else {
+            network_lines
+        },
+    );
+
+    let process_lines = snapshot
+        .processes
+        .top
+        .iter()
+        .take(5)
+        .map(|process| {
+            Line::from(format!(
+                "{:>6} {:>7} {}",
+                process.pid,
+                status_percent(process.cpu_percent),
+                process.command
+            ))
+        })
+        .collect::<Vec<_>>();
+    render_status_panel(
+        frame,
+        third_row[0],
+        "Top Processes",
+        if process_lines.is_empty() {
+            vec![Line::from("Process data unavailable")]
+        } else {
+            process_lines
+        },
+    );
+
+    let mut alert_lines = snapshot
+        .high_cpu_alerts
+        .iter()
+        .map(|alert| Line::from(format!("High CPU: {} ({})", alert.command, alert.pid)))
+        .collect::<Vec<_>>();
+    for battery in &snapshot.batteries {
+        alert_lines.push(Line::from(format!(
+            "Battery {} {}% {}",
+            battery.name,
+            battery
+                .capacity_percent
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+            battery.status.as_deref().unwrap_or("unknown")
+        )));
+    }
+    for thermal in &snapshot.thermal {
+        alert_lines.push(Line::from(format!(
+            "Thermal {} {} {}",
+            thermal.name,
+            thermal.sensor_type.as_deref().unwrap_or("unknown"),
+            thermal.millicelsius.map_or_else(
+                || "unknown".to_owned(),
+                |value| format!(
+                    "{}.{:01}°C",
+                    value / 1000,
+                    (value.unsigned_abs() % 1000) / 100
+                )
+            )
+        )));
+    }
+    if alert_lines.is_empty() {
+        alert_lines.push(Line::from("No active alerts"));
+    }
+    render_status_panel(frame, third_row[1], "Alerts / Power / Thermal", alert_lines);
+    frame.render_widget(
+        Paragraph::new(format!(
+            " q / Esc quit  ·  refresh every {}",
+            status_duration(interval)
+        )),
+        chunks[4],
+    );
+}
+
+fn render_status_panel(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    title: &str,
+    lines: Vec<Line<'static>>,
+) {
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(format!(" {title} "))
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+fn status_percent(value: Option<f64>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1}%"))
+}
+
+fn status_cpu_bar(value: Option<f64>, width: u32) -> String {
+    let Some(value) = value else {
+        return format!("[{}]", "?".repeat(usize::try_from(width).unwrap_or(20)));
+    };
+    let value = value.clamp(0.0, 100.0);
+    let blocks = (0_u32..width)
+        .map(|index| {
+            if value >= f64::from(index + 1) * 100.0 / f64::from(width) {
+                '█'
+            } else {
+                '░'
+            }
+        })
+        .collect::<String>();
+    format!("[{blocks}]")
+}
+
+fn status_byte_rate(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |rate| format!("{rate} B/s"))
+}
+
+fn status_duration(value: Duration) -> String {
+    if value.as_secs() > 0 {
+        format!("{}s", value.as_secs())
+    } else {
+        format!("{}ms", value.as_millis())
     }
 }
 

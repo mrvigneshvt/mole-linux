@@ -61,7 +61,6 @@ fn unsupported_subcommands_parse_flags_and_exit_two() {
             34,
         ),
         (&["optimize", "--dry-run", "--whitelist"], 39),
-        (&["history", "--json", "--limit", "5"], 12),
     ];
 
     for (args, issue) in cases {

@@ -128,8 +128,19 @@ struct OptimizeArgs {
 struct HistoryArgs {
     #[arg(long)]
     json: bool,
-    #[arg(long)]
+    #[arg(long, value_parser = parse_history_limit)]
     limit: Option<usize>,
+}
+
+fn parse_history_limit(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer".to_string())?;
+    if (1..=200).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err("limit must be between 1 and 200".to_string())
+    }
 }
 
 #[derive(Debug, Args)]
@@ -202,7 +213,7 @@ fn run() -> io::Result<()> {
         Command::Installer(_) => not_implemented("installer", 33),
         Command::Uninstall(_) => not_implemented("uninstall", 34),
         Command::Optimize(_) => not_implemented("optimize", 39),
-        Command::History(_) => not_implemented("history", 12),
+        Command::History(args) => mole_linux::core::oplog::run(args.json, args.limit),
         Command::Completion(args) => run_completion(args),
     }
 }

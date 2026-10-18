@@ -1,0 +1,10 @@
+[package]
+name = "mole-linux"
+version = "0.1.0"
+edition = "2024"
+description = "A Linux-first system cleanup and inspection tool"
+license = "MIT"
+
+[[bin]]
+name = "mole-linux"
+path = "src/main.rs"

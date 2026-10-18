@@ -9,56 +9,68 @@ fn run(args: &[&str]) -> Output {
 
 #[test]
 fn unimplemented_subcommands_parse_flags_and_exit_two() {
-    let cases: &[&[&str]] = &[
-        &["status", "--json", "--watch", "--interval", "2"],
-        &[
-            "clean",
-            "--dry-run",
-            "--categories",
-            "cache",
-            "--select",
-            "one",
-            "--exclude",
-            "two",
-            "--external",
-            "--whitelist",
-        ],
-        &[
-            "purge",
-            "--dry-run",
-            "--paths",
-            "target",
-            "--include-empty",
-            "--yes",
-        ],
-        &[
-            "installer",
-            "--dry-run",
-            "--max-depth",
-            "2",
-            "--hidden",
-            "--type",
-            "zip",
-        ],
-        &[
-            "uninstall",
-            "--dry-run",
-            "--list",
-            "--permanent",
-            "--whitelist",
-        ],
-        &["optimize", "--dry-run", "--whitelist"],
-        &["history", "--json", "--limit", "5"],
-        &["completion", "bash", "--dry-run"],
+    let cases: &[(&[&str], u32)] = &[
+        (&["status", "--json", "--watch", "--interval", "2"], 37),
+        (
+            &[
+                "clean",
+                "--dry-run",
+                "--categories",
+                "cache",
+                "--select",
+                "one",
+                "--exclude",
+                "two",
+                "--external",
+                "--whitelist",
+            ],
+            16,
+        ),
+        (
+            &[
+                "purge",
+                "--dry-run",
+                "--paths",
+                "target",
+                "--include-empty",
+                "--yes",
+            ],
+            31,
+        ),
+        (
+            &[
+                "installer",
+                "--dry-run",
+                "--max-depth",
+                "2",
+                "--hidden",
+                "--type",
+                "zip",
+            ],
+            33,
+        ),
+        (
+            &[
+                "uninstall",
+                "--dry-run",
+                "--list",
+                "--permanent",
+                "--whitelist",
+            ],
+            34,
+        ),
+        (&["optimize", "--dry-run", "--whitelist"], 39),
+        (&["history", "--json", "--limit", "5"], 12),
+        (&["completion", "bash", "--dry-run"], 41),
     ];
 
-    for args in cases {
+    for (args, issue) in cases {
         let output = run(args);
         assert_eq!(output.status.code(), Some(2), "args: {args:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("not implemented yet (#3)"),
-            "args: {args:?}, stderr: {stderr}"
+            stderr.contains(&format!("not implemented yet (#{issue})")),
+            "args: {args:?}, expected issue #{issue}, stderr: {stderr}"
         );
     }
 }
@@ -68,7 +80,7 @@ fn analyze_json_is_explicitly_unimplemented() {
     let output = run(&["analyze", "--json"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("JSON output is not implemented yet (#3)")
+        String::from_utf8_lossy(&output.stderr).contains("JSON output is not implemented yet (#7)")
     );
 }
 
@@ -77,7 +89,7 @@ fn global_debug_is_accepted_before_and_after_subcommand() {
     for args in [&["--debug", "clean"][..], &["clean", "--debug"][..]] {
         let output = run(args);
         assert_eq!(output.status.code(), Some(2), "args: {args:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("not implemented yet (#3)"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not implemented yet (#16)"));
     }
 }
 

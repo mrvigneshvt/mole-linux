@@ -174,27 +174,27 @@ fn run() -> io::Result<()> {
             if args.json {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "JSON output is not implemented yet (#3)",
+                    "JSON output is not implemented yet (#7)",
                 ));
             }
             let path = args.path.unwrap_or_else(|| PathBuf::from("."));
             run_analyzer(path)
         }
-        Command::Status(_) => not_implemented("status"),
-        Command::Clean(_) => not_implemented("clean"),
-        Command::Purge(_) => not_implemented("purge"),
-        Command::Installer(_) => not_implemented("installer"),
-        Command::Uninstall(_) => not_implemented("uninstall"),
-        Command::Optimize(_) => not_implemented("optimize"),
-        Command::History(_) => not_implemented("history"),
-        Command::Completion(_) => not_implemented("completion"),
+        Command::Status(_) => not_implemented("status", 37),
+        Command::Clean(_) => not_implemented("clean", 16),
+        Command::Purge(_) => not_implemented("purge", 31),
+        Command::Installer(_) => not_implemented("installer", 33),
+        Command::Uninstall(_) => not_implemented("uninstall", 34),
+        Command::Optimize(_) => not_implemented("optimize", 39),
+        Command::History(_) => not_implemented("history", 12),
+        Command::Completion(_) => not_implemented("completion", 41),
     }
 }
 
-fn not_implemented(command: &str) -> io::Result<()> {
+fn not_implemented(command: &str, issue: u32) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        format!("{command} is not implemented yet (#3)"),
+        format!("{command} is not implemented yet (#{issue})"),
     ))
 }
 

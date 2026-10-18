@@ -3,6 +3,7 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use super::paths::XdgPaths;
+use super::whitelist::Whitelist;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValidationError {
@@ -158,6 +159,11 @@ fn check_policy(path: &Path, home: &Path, xdg: &XdgPaths) -> Result<(), Validati
         .any(|part| part.as_os_str() == OsStr::new(".git"))
         || path_is_repository_root(&normalized)?
     {
+        return Err(ValidationError::Protected(normalized));
+    }
+    let whitelist =
+        Whitelist::load(xdg).map_err(|_| ValidationError::Unverifiable(Whitelist::path(xdg)))?;
+    if whitelist.is_whitelisted(&normalized) {
         return Err(ValidationError::Protected(normalized));
     }
     Ok(())

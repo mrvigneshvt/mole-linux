@@ -283,6 +283,7 @@ use rustix::fs::{statfs, statvfs};
 
 use crate::scan;
 use crate::scan::{EntryKind, Node, NodeStatus, ScanEvent, ScanReport};
+use crate::status;
 
 static TERMINAL_ACTIVE: GlobalAtomicBool = GlobalAtomicBool::new(false);
 
@@ -1039,6 +1040,61 @@ pub fn run(
     }
     drop(terminal);
     terminal_guard.restore()
+}
+
+pub fn run_status() -> io::Result<()> {
+    install_panic_restore_hook();
+    let _terminal_guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::new(backend)?;
+    let mut tracker = status::StatusTracker::default();
+    loop {
+        let mut snapshot = status::collect();
+        tracker.update(&mut snapshot, std::time::Instant::now());
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(area);
+            frame.render_widget(
+                Paragraph::new(status::text_report(&snapshot)).block(
+                    Block::default()
+                        .title(" System Status ")
+                        .borders(Borders::ALL),
+                ),
+                chunks[0],
+            );
+            frame.render_widget(
+                Paragraph::new(" q / Esc quit  •  refreshes every second "),
+                chunks[1],
+            );
+        })?;
+
+        let last_refresh = std::time::Instant::now();
+        loop {
+            let elapsed = last_refresh.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                break;
+            }
+            let remaining = Duration::from_secs(1).saturating_sub(elapsed);
+            if event::poll(remaining.min(Duration::from_millis(100)))? {
+                let Event::Key(key) = event::read()? else {
+                    continue;
+                };
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 fn install_panic_restore_hook() {

@@ -1,4 +1,5 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,8 +71,8 @@ struct StatusArgs {
     #[arg(long)]
     watch: bool,
     /// Watch interval in seconds
-    #[arg(long, default_value_t = 1)]
-    interval: u64,
+    #[arg(long, default_value = "1")]
+    interval: NonZeroU64,
 }
 
 #[derive(Debug, Args)]
@@ -384,23 +385,32 @@ fn replace_completion_block(existing: &str, shell: Shell, remove: bool) -> io::R
 
 fn run_status(args: StatusArgs) -> io::Result<()> {
     if args.watch {
-        let interval = args.interval.max(1);
+        let interval = std::time::Duration::from_secs(args.interval.get());
         let mut tracker = status::StatusTracker::default();
         loop {
             let mut snapshot = status::collect();
             tracker.update(&mut snapshot, std::time::Instant::now());
-            print_snapshot(&snapshot, true)?;
-            std::thread::sleep(std::time::Duration::from_secs(interval));
+            if let Err(error) = print_snapshot(&snapshot, true) {
+                if error.kind() == io::ErrorKind::BrokenPipe {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            std::thread::sleep(interval);
         }
     }
+    if !args.json && io::stdout().is_terminal() {
+        return tui::run_status();
+    }
     let snapshot = status::collect();
-    print_snapshot(&snapshot, args.json)
+    print_snapshot(&snapshot, args.json || !io::stdout().is_terminal())
 }
 
 fn print_snapshot(snapshot: &status::Snapshot, json: bool) -> io::Result<()> {
     if json {
-        serde_json::to_writer(io::stdout().lock(), &snapshot).map_err(io::Error::other)?;
-        println!();
+        let mut stdout = io::stdout().lock();
+        serde_json::to_writer(&mut stdout, &snapshot).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
     } else {
         io::stdout()
             .lock()

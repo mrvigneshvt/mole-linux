@@ -28,6 +28,7 @@ pub enum NodeStatus {
 pub struct Node {
     pub name: OsString,
     pub kind: EntryKind,
+    pub cleanable: bool,
     pub apparent: u64,
     pub allocated: u64,
     pub children: Vec<Node>,
@@ -66,6 +67,8 @@ struct JsonEntry {
     apparent_bytes: u64,
     allocated_bytes: u64,
     is_dir: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    cleanable: bool,
 }
 
 #[derive(Serialize)]
@@ -135,6 +138,7 @@ fn json_entry(node: &Node, path: &Path) -> JsonEntry {
         apparent_bytes: node.apparent,
         allocated_bytes: node.allocated,
         is_dir: node.kind == EntryKind::Directory,
+        cleanable: node.cleanable,
     }
 }
 
@@ -247,6 +251,7 @@ where
             let node = Node {
                 name,
                 kind,
+                cleanable: false,
                 apparent: 0,
                 allocated: 0,
                 children: Vec::new(),
@@ -267,6 +272,8 @@ where
         let node = Node {
             name,
             kind,
+            cleanable: kind == EntryKind::Directory
+                && crate::cleanable::is_cleanable_dir(&entry_path),
             apparent: if duplicate_hardlink {
                 0
             } else {
@@ -398,6 +405,7 @@ pub fn scan_progressive(path: &Path, cancel: &AtomicBool, events: Sender<ScanEve
     let mut root = Node {
         name,
         kind: EntryKind::Directory,
+        cleanable: crate::cleanable::is_cleanable_dir(path),
         apparent: root_metadata.len(),
         allocated: root_metadata.blocks().saturating_mul(512),
         children: Vec::new(),
@@ -439,6 +447,7 @@ pub fn scan_progressive(path: &Path, cancel: &AtomicBool, events: Sender<ScanEve
                     root.children.push(Node {
                         name: child_name,
                         kind,
+                        cleanable: false,
                         apparent: 0,
                         allocated: 0,
                         children: Vec::new(),
@@ -454,6 +463,8 @@ pub fn scan_progressive(path: &Path, cancel: &AtomicBool, events: Sender<ScanEve
                     let node = Node {
                         name: child_name,
                         kind,
+                        cleanable: kind == EntryKind::Directory
+                            && crate::cleanable::is_cleanable_dir(&child_path),
                         apparent: if duplicate { 0 } else { metadata.len() },
                         allocated: if duplicate {
                             0
@@ -593,6 +604,7 @@ fn unavailable_node(name: OsString, reason: String) -> Node {
     Node {
         name,
         kind: EntryKind::Other,
+        cleanable: false,
         apparent: 0,
         allocated: 0,
         children: Vec::new(),

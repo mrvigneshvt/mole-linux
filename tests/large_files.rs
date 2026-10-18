@@ -8,6 +8,7 @@ fn file(name: &str, size: u64) -> Node {
     Node {
         name: OsString::from(name),
         kind: EntryKind::File,
+        cleanable: false,
         apparent: size,
         allocated: size,
         children: Vec::new(),
@@ -20,6 +21,7 @@ fn large_files_view_keeps_top_twenty_and_unknown_files_unselectable() {
     let mut root = Node {
         name: OsString::from("root"),
         kind: EntryKind::Directory,
+        cleanable: false,
         apparent: 0,
         allocated: 0,
         children: (0_u64..25)
@@ -30,6 +32,7 @@ fn large_files_view_keeps_top_twenty_and_unknown_files_unselectable() {
     root.children.push(Node {
         name: OsString::from("unknown"),
         kind: EntryKind::File,
+        cleanable: false,
         apparent: 0,
         allocated: 0,
         children: Vec::new(),

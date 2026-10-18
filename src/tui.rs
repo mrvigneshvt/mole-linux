@@ -182,7 +182,39 @@ mod tests {
         app.toggle_size_mode();
         assert_eq!(app.size_mode, SizeMode::Apparent);
     }
+
+    #[test]
+    fn test_backend_renders_large_files_and_filter_prompt() {
+        let mut app = App::new(PathBuf::from("/tmp"), sample_tree(), None, false);
+        app.show_large_files = true;
+        app.large_files = super::LargeFilesView::from_entries(vec![
+            (PathBuf::from("/tmp/large.bin"), Some(8 * 1024)),
+            (PathBuf::from("/tmp/unknown.bin"), None),
+        ]);
+        app.large_files.begin_filter();
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render large files");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Top 20 large files"));
+        assert!(rendered.contains("large.bin"));
+        assert!(rendered.contains("unknown.bin"));
+        assert!(rendered.contains("Filter:"));
+        app.large_files.move_selection(1);
+        app.large_files.toggle_selected();
+        assert_eq!(app.large_files.selected_count(), 0);
+    }
 }
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
 use std::ffi::OsStr;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
@@ -205,6 +237,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 use rustix::fs::statvfs;
 
+use crate::scan;
 use crate::scan::{EntryKind, Node, NodeStatus, ScanEvent, ScanReport};
 
 static TERMINAL_ACTIVE: GlobalAtomicBool = GlobalAtomicBool::new(false);
@@ -213,6 +246,170 @@ static TERMINAL_ACTIVE: GlobalAtomicBool = GlobalAtomicBool::new(false);
 pub enum SizeMode {
     Allocated,
     Apparent,
+}
+
+const LARGE_FILE_LIMIT: usize = 20;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LargeFileEntry {
+    pub path: PathBuf,
+    pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LargeFiles {
+    entries: Vec<LargeFileEntry>,
+}
+
+impl LargeFiles {
+    // Ported from tw93/Mole cmd/analyze/update.go large-file navigation (GPL-3.0).
+    pub fn from_tree(root: &Node, base: &Path) -> Self {
+        let mut heap = BinaryHeap::<Reverse<(u64, PathBuf)>>::new();
+        collect_large_files(root, base, &mut heap);
+        let mut entries = heap
+            .into_iter()
+            .map(|Reverse((size, path))| LargeFileEntry {
+                path,
+                size: Some(size),
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            right
+                .size
+                .cmp(&left.size)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        Self { entries }
+    }
+
+    pub fn from_entries(entries: Vec<(PathBuf, Option<u64>)>) -> Self {
+        let mut entries = entries
+            .into_iter()
+            .map(|(path, size)| LargeFileEntry { path, size })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            right
+                .size
+                .cmp(&left.size)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        entries.truncate(LARGE_FILE_LIMIT);
+        Self { entries }
+    }
+
+    pub fn entries(&self) -> &[LargeFileEntry] {
+        &self.entries
+    }
+}
+
+fn collect_large_files(node: &Node, path: &Path, heap: &mut BinaryHeap<Reverse<(u64, PathBuf)>>) {
+    let mut pending = vec![(node, path.to_owned())];
+    while let Some((parent, parent_path)) = pending.pop() {
+        for child in &parent.children {
+            let child_path = parent_path.join(&child.name);
+            if child.kind == EntryKind::File
+                && !matches!(
+                    child.status,
+                    NodeStatus::Unavailable(_) | NodeStatus::Partial
+                )
+            {
+                let candidate = (child.apparent, child_path.clone());
+                if heap.len() < LARGE_FILE_LIMIT {
+                    heap.push(Reverse(candidate));
+                } else if heap.peek().is_some_and(|smallest| candidate > smallest.0) {
+                    heap.pop();
+                    heap.push(Reverse(candidate));
+                }
+            }
+            pending.push((child, child_path));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LargeFilesView {
+    files: LargeFiles,
+    filter: String,
+    filtering: bool,
+    selected_index: usize,
+    selected: HashSet<PathBuf>,
+}
+
+impl LargeFilesView {
+    pub fn new(files: LargeFiles) -> Self {
+        Self {
+            files,
+            ..Self::default()
+        }
+    }
+    pub fn from_entries(entries: Vec<(PathBuf, Option<u64>)>) -> Self {
+        Self::new(LargeFiles::from_entries(entries))
+    }
+    pub fn visible_entries(&self) -> Vec<&LargeFileEntry> {
+        self.files
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .path
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&self.filter.to_lowercase())
+            })
+            .collect()
+    }
+    pub fn selected_count(&self) -> usize {
+        self.selected.len()
+    }
+    pub fn toggle_selected(&mut self) {
+        if let Some(entry) = self.visible_entries().get(self.selected_index).copied()
+            && entry.size.is_some()
+        {
+            let path = entry.path.clone();
+            if !self.selected.remove(&path) {
+                self.selected.insert(path);
+            }
+        }
+    }
+    pub fn begin_filter(&mut self) {
+        self.filtering = true;
+    }
+    pub fn push_filter(&mut self, text: &str) {
+        self.filter.push_str(text);
+        self.selected_index = 0;
+    }
+    pub fn apply_filter(&mut self) {
+        self.filtering = false;
+        self.selected_index = 0;
+    }
+    pub fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.filtering = false;
+        self.selected_index = 0;
+    }
+    pub fn move_selection(&mut self, delta: isize) {
+        let count = self.visible_entries().len();
+        if count == 0 {
+            self.selected_index = 0;
+            return;
+        }
+        self.selected_index = if delta.is_negative() {
+            self.selected_index.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.selected_index
+                .saturating_add(usize::try_from(delta).unwrap_or(usize::MAX))
+                .min(count - 1)
+        };
+    }
+    pub fn restore(&mut self, previous: Self) {
+        *self = previous;
+    }
+    fn is_filtering(&self) -> bool {
+        self.filtering
+    }
+    fn filter(&self) -> &str {
+        &self.filter
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,6 +532,8 @@ pub struct App {
     pub size_mode: SizeMode,
     spinner_index: usize,
     scan_failed: bool,
+    large_files: LargeFilesView,
+    show_large_files: bool,
 }
 
 impl App {
@@ -352,6 +551,8 @@ impl App {
             size_mode: SizeMode::Allocated,
             spinner_index: 0,
             scan_failed: false,
+            large_files: LargeFilesView::default(),
+            show_large_files: false,
         }
     }
 
@@ -363,6 +564,7 @@ impl App {
     }
 
     fn accept_report(&mut self, report: ScanReport) {
+        self.large_files = LargeFilesView::new(LargeFiles::from_tree(&report.root, &self.path));
         self.navigator = Navigator::new(report.root);
         self.scanning = false;
     }
@@ -517,6 +719,63 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     ]);
     frame.render_widget(header, chunks[0]);
 
+    if app.show_large_files {
+        let visible = app.large_files.visible_entries();
+        let items = visible
+            .iter()
+            .map(|entry| {
+                let selected = if app.large_files.selected.contains(&entry.path) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                let size = entry.size.map_or_else(|| "?".to_owned(), format_size);
+                ListItem::new(format!(
+                    "{selected} {size} {}",
+                    escape_name(entry.path.as_os_str())
+                ))
+            })
+            .collect::<Vec<_>>();
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Top 20 large files"),
+            )
+            .highlight_symbol("> ")
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            );
+        let mut state = ListState::default();
+        if !visible.is_empty() {
+            state.select(Some(
+                app.large_files
+                    .selected_index
+                    .min(visible.len().saturating_sub(1)),
+            ));
+        }
+        frame.render_stateful_widget(list, chunks[1], &mut state);
+        let footer = if app.large_files.is_filtering() {
+            format!(
+                "Filter: {}_  Enter apply  Esc clear",
+                app.large_files.filter()
+            )
+        } else {
+            format!(
+                "↑/↓ move  / filter  Space select  r refresh  Esc back{}",
+                if app.large_files.selected_count() > 0 {
+                    format!("  {} selected", app.large_files.selected_count())
+                } else {
+                    String::new()
+                }
+            )
+        };
+        frame.render_widget(Paragraph::new(footer), chunks[2]);
+        return;
+    }
+
     let denominator = size_for_mode(current, app.size_mode);
     let items = current
         .children
@@ -569,12 +828,16 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     }
     frame.render_stateful_widget(list, chunks[1], &mut state);
     frame.render_widget(
-        Paragraph::new("↑/↓ or j/k move  Enter/l descend  h/Backspace up  a size  q quit"),
+        Paragraph::new("↑/↓ or j/k move  Enter/l descend  h/Backspace up  t large files  r refresh  a size  q quit"),
         chunks[2],
     );
 }
 
-pub fn run(path: &Path, reports: Receiver<ScanEvent>, cancel: Arc<AtomicBool>) -> io::Result<()> {
+pub fn run(
+    path: &Path,
+    mut reports: Receiver<ScanEvent>,
+    cancel: Arc<AtomicBool>,
+) -> io::Result<()> {
     install_panic_restore_hook();
     let mut terminal_guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
@@ -592,6 +855,8 @@ pub fn run(path: &Path, reports: Receiver<ScanEvent>, cancel: Arc<AtomicBool>) -
         FilesystemStats::for_path(path),
         true,
     );
+    let mut active_cancel = Arc::clone(&cancel);
+    let mut refresh_worker: Option<std::thread::JoinHandle<()>> = None;
 
     loop {
         match reports.try_recv() {
@@ -612,8 +877,45 @@ pub fn run(path: &Path, reports: Receiver<ScanEvent>, cancel: Arc<AtomicBool>) -
                 continue;
             }
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('q') => break,
+                KeyCode::Esc
+                    if app.show_large_files
+                        && (app.large_files.is_filtering()
+                            || !app.large_files.filter().is_empty()) =>
+                {
+                    app.large_files.clear_filter()
+                }
+                KeyCode::Esc if app.show_large_files => app.show_large_files = false,
+                KeyCode::Esc => break,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                KeyCode::Up | KeyCode::Char('k')
+                    if app.show_large_files && !app.large_files.is_filtering() =>
+                {
+                    app.large_files.move_selection(-1)
+                }
+                KeyCode::Down | KeyCode::Char('j')
+                    if app.show_large_files && !app.large_files.is_filtering() =>
+                {
+                    app.large_files.move_selection(1)
+                }
+                KeyCode::Char(' ') if app.show_large_files && !app.large_files.is_filtering() => {
+                    app.large_files.toggle_selected()
+                }
+                KeyCode::Enter if app.show_large_files && app.large_files.is_filtering() => {
+                    app.large_files.apply_filter()
+                }
+                KeyCode::Char(character)
+                    if app.show_large_files && app.large_files.is_filtering() =>
+                {
+                    app.large_files.push_filter(&character.to_string())
+                }
+                KeyCode::Backspace if app.show_large_files && app.large_files.is_filtering() => {
+                    app.large_files.filter.pop();
+                }
+                KeyCode::Char('h') | KeyCode::Backspace if app.show_large_files => {
+                    app.show_large_files = false;
+                    app.navigator.up();
+                }
                 KeyCode::Up | KeyCode::Char('k') => app.navigator.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => app.navigator.move_selection(1),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -623,11 +925,41 @@ pub fn run(path: &Path, reports: Receiver<ScanEvent>, cancel: Arc<AtomicBool>) -
                     app.navigator.up();
                 }
                 KeyCode::Char('a') => app.toggle_size_mode(),
+                KeyCode::Char('t') if !app.scanning => app.show_large_files = !app.show_large_files,
+                KeyCode::Char('/') if app.show_large_files => app.large_files.begin_filter(),
+                KeyCode::Char('r') => {
+                    active_cancel.store(true, Ordering::Relaxed);
+                    if let Some(worker) = refresh_worker.take() {
+                        worker
+                            .join()
+                            .map_err(|_| io::Error::other("refresh scanner worker panicked"))?;
+                    }
+                    let next_cancel = Arc::new(AtomicBool::new(false));
+                    let worker_cancel = Arc::clone(&next_cancel);
+                    let worker_path = path.to_owned();
+                    let (sender, receiver) = std::sync::mpsc::channel();
+                    refresh_worker = Some(
+                        std::thread::Builder::new()
+                            .name("mole-refresh".to_owned())
+                            .spawn(move || {
+                                scan::scan_progressive(&worker_path, &worker_cancel, sender)
+                            })?,
+                    );
+                    active_cancel = next_cancel;
+                    reports = receiver;
+                    app.scanning = true;
+                    app.scan_failed = false;
+                }
                 _ => {}
             }
         }
     }
-    cancel.store(true, Ordering::Relaxed);
+    active_cancel.store(true, Ordering::Relaxed);
+    if let Some(worker) = refresh_worker {
+        worker
+            .join()
+            .map_err(|_| io::Error::other("refresh scanner worker panicked"))?;
+    }
     drop(terminal);
     terminal_guard.restore()
 }

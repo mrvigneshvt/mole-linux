@@ -49,6 +49,8 @@ or `SUPERSET_WORKER_BLOCKED` / `task:` / `reason:` / `needs:`.
 
 ## Layout
 
+**Conflict avoidance (parallel workers):** put each command's logic in `src/commands/<cmd>.rs` (register in `src/commands/mod.rs`, one line) and keep `src/main.rs` changes to the single dispatch arm. Put new tests in their own file `tests/<feature>.rs`; do not append to `tests/cli.rs`. Add deps with one line each in the existing tables.
+
 ```
 src/main.rs  src/lib.rs  src/scan.rs  src/tui.rs     (M1, exists)
 src/core/{paths,policy,validate,sink,oplog,outcome,proc,units}.rs

@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, shells};
 use mole_linux::commands::status::StatusArgs;
 use mole_linux::core::fsutil::{atomic_replace, resolve_symlink_chain};
-use mole_linux::{scan, tui};
+use mole_linux::{commands::snapshots, scan, tui};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,6 +37,8 @@ enum Command {
     Analyze(AnalyzeArgs),
     /// Show system status
     Status(StatusArgs),
+    /// List Btrfs and Snapper snapshots without changing them
+    Snapshots,
     /// Clean supported caches
     Clean(CleanArgs),
     /// Purge development artifacts
@@ -194,6 +196,7 @@ fn run() -> io::Result<()> {
             }
         }
         Command::Status(args) => mole_linux::commands::status::run(args),
+        Command::Snapshots => snapshots::run(),
         Command::Clean(_) => not_implemented("clean", 16),
         Command::Purge(_) => not_implemented("purge", 31),
         Command::Installer(_) => not_implemented("installer", 33),

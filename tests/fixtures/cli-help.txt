@@ -5,6 +5,7 @@ Usage: mole-linux [OPTIONS] [PATH] [COMMAND]
 Commands:
   analyze     Analyze disk usage at PATH
   status      Show system status
+  snapshots   List Btrfs and Snapper snapshots without changing them
   clean       Clean supported caches
   purge       Purge development artifacts
   installer   Find installer files

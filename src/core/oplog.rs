@@ -8,12 +8,20 @@ use serde::Serialize;
 const MAX_TAIL_BYTES: u64 = 1024 * 1024;
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 200;
+pub const OUTCOME_NAMES: [&str; 6] = [
+    "applied",
+    "unchanged",
+    "skipped",
+    "unavailable",
+    "attention",
+    "failed",
+];
 
 #[derive(Debug, Serialize)]
 struct History {
     logs: LogPaths,
     limit: usize,
-    sessions: Vec<Session>,
+    sessions: Vec<HistorySession>,
     deletions: Vec<Deletion>,
 }
 
@@ -24,7 +32,7 @@ struct LogPaths {
 }
 
 #[derive(Debug, Serialize)]
-struct Session {
+struct HistorySession {
     command: String,
     run_id: String,
     attribution: String,
@@ -34,6 +42,8 @@ struct Session {
     size: String,
     operation_count: u64,
     failed_tasks: u64,
+    malformed_summaries: u64,
+    ambiguous: bool,
     actions: Actions,
 }
 
@@ -66,6 +76,9 @@ struct SessionBuilder {
     size: String,
     operation_count: u64,
     failed_tasks: u64,
+    malformed_summaries: u64,
+    ambiguous: bool,
+    marker_sequence: u64,
     actions: Actions,
 }
 
@@ -106,14 +119,9 @@ struct Paths {
 }
 
 fn log_paths() -> io::Result<Paths> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| home.join(".local/state"));
-    let directory = state.join("mole-linux");
+    let paths = crate::core::paths::XdgPaths::from_env()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set or invalid"))?;
+    let directory = paths.state.join("mole-linux");
     Ok(Paths {
         operations: directory.join("operations.log"),
         deletions: directory.join("deletions.log"),
@@ -144,61 +152,87 @@ fn read_tail(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 // Ported from tw93/Mole lib/core/history.sh:history_load_operations (GPL-3.0).
-fn load_sessions(path: &Path) -> io::Result<Vec<Session>> {
+fn load_sessions(path: &Path) -> io::Result<Vec<HistorySession>> {
     let bytes = read_tail(path)?;
     let text = String::from_utf8_lossy(&bytes);
     let mut sessions: Vec<SessionBuilder> = Vec::new();
     let mut active: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut marker_sequence = 0_u64;
     for line in text.lines() {
         if let Some((identity, started)) = parse_marker(line, " session started at ") {
-            let (command, run_id) = parse_identity(identity);
+            let Some((command, run_id)) = parse_identity(identity) else {
+                continue;
+            };
+            marker_sequence = marker_sequence.saturating_add(1);
+            let key = (command.clone(), run_id.clone());
+            let ambiguous = run_id.is_empty() && active.contains_key(&key);
+            if let Some(previous) = active.get(&key).copied() {
+                sessions[previous].ended_at = started.to_string();
+                if ambiguous {
+                    sessions[previous].ambiguous = true;
+                }
+            }
             let index = sessions.len();
             sessions.push(SessionBuilder {
                 command: command.clone(),
                 run_id: run_id.clone(),
                 started_at: started.to_string(),
                 size: "0B".to_string(),
+                ambiguous,
+                marker_sequence,
                 ..SessionBuilder::default()
             });
-            active.insert((command, run_id), index);
+            active.insert(key, index);
             continue;
         }
         if let Some((identity, rest)) = parse_end_marker(line) {
-            let (command, run_id) = parse_identity(identity);
-            let index = *active
-                .entry((command.clone(), run_id.clone()))
-                .or_insert_with(|| {
-                    sessions.push(SessionBuilder {
-                        command: command.clone(),
-                        run_id: run_id.clone(),
-                        size: "0B".to_string(),
-                        ..SessionBuilder::default()
-                    });
-                    sessions.len() - 1
+            let Some((command, run_id)) = parse_identity(identity) else {
+                continue;
+            };
+            let key = (command.clone(), run_id.clone());
+            let index = *active.entry(key.clone()).or_insert_with(|| {
+                sessions.push(SessionBuilder {
+                    command: command.clone(),
+                    run_id: run_id.clone(),
+                    size: "0B".to_string(),
+                    marker_sequence: marker_sequence.saturating_add(1),
+                    ..SessionBuilder::default()
                 });
+                sessions.len() - 1
+            });
             let session = &mut sessions[index];
-            let (ended, items, size) = parse_end_summary(rest);
+            let (ended, items, size, malformed) = parse_end_summary(rest);
+            if session.started_at.is_empty() {
+                session.started_at = ended.to_string();
+            }
             session.ended_at = ended.to_string();
-            session.items = items.unwrap_or(session.operation_count);
+            session.items = items.unwrap_or(0);
             if let Some(size) = size {
                 session.size = size.to_string();
             }
+            if malformed {
+                session.malformed_summaries = session.malformed_summaries.saturating_add(1);
+            }
+            active.remove(&key);
             continue;
         }
         if let Some((timestamp, identity, action)) = parse_operation(line) {
-            let (command, run_id) = parse_identity(identity);
-            let index = *active
-                .entry((command.clone(), run_id.clone()))
-                .or_insert_with(|| {
-                    sessions.push(SessionBuilder {
-                        command: command.clone(),
-                        run_id: run_id.clone(),
-                        started_at: timestamp.to_string(),
-                        size: "0B".to_string(),
-                        ..SessionBuilder::default()
-                    });
-                    sessions.len() - 1
+            let Some((command, run_id)) = parse_identity(identity) else {
+                continue;
+            };
+            let key = (command.clone(), run_id.clone());
+            let index = *active.entry(key).or_insert_with(|| {
+                marker_sequence = marker_sequence.saturating_add(1);
+                sessions.push(SessionBuilder {
+                    command: command.clone(),
+                    run_id: run_id.clone(),
+                    started_at: timestamp.to_string(),
+                    size: "0B".to_string(),
+                    marker_sequence,
+                    ..SessionBuilder::default()
                 });
+                sessions.len() - 1
+            });
             let session = &mut sessions[index];
             session.operation_count = session.operation_count.saturating_add(1);
             let count = match action {
@@ -213,11 +247,23 @@ fn load_sessions(path: &Path) -> io::Result<Vec<Session>> {
             *count = count.saturating_add(1);
         }
     }
+    sessions.sort_by_key(|session| {
+        (
+            if session.started_at.is_empty() {
+                session.ended_at.clone()
+            } else {
+                session.started_at.clone()
+            },
+            session.marker_sequence,
+        )
+    });
     Ok(sessions
         .into_iter()
-        .map(|session| Session {
+        .map(|session| HistorySession {
             command: session.command,
-            attribution: if session.run_id.is_empty() {
+            attribution: if session.ambiguous {
+                "ambiguous".to_string()
+            } else if session.run_id.is_empty() {
                 "command".to_string()
             } else {
                 "run".to_string()
@@ -229,12 +275,14 @@ fn load_sessions(path: &Path) -> io::Result<Vec<Session>> {
             size: session.size,
             operation_count: session.operation_count,
             failed_tasks: session.failed_tasks,
+            malformed_summaries: session.malformed_summaries,
+            ambiguous: session.ambiguous,
             actions: session.actions,
         })
         .collect())
 }
 
-fn parse_identity(identity: &str) -> (String, String) {
+fn parse_identity(identity: &str) -> Option<(String, String)> {
     match identity.split_once(" run=") {
         Some((command, run_id))
             if !command.is_empty()
@@ -243,9 +291,11 @@ fn parse_identity(identity: &str) -> (String, String) {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)) =>
         {
-            (command.to_string(), run_id.to_string())
+            Some((command.to_string(), run_id.to_string()))
         }
-        _ => (identity.to_string(), String::new()),
+        Some(_) => None,
+        None if !identity.is_empty() => Some((identity.to_string(), String::new())),
+        None => None,
     }
 }
 
@@ -262,14 +312,45 @@ fn parse_end_marker(line: &str) -> Option<(&str, &str)> {
     Some((command, rest.strip_suffix(" ==========")?))
 }
 
-fn parse_end_summary(rest: &str) -> (&str, Option<u64>, Option<&str>) {
+fn parse_end_summary(rest: &str) -> (&str, Option<u64>, Option<&str>, bool) {
     let Some((ended, tail)) = rest.split_once(", ") else {
-        return (rest, None, None);
+        return (rest, None, None, !valid_timestamp(rest));
     };
     let Some((items, size)) = tail.split_once(" items, ") else {
-        return (rest, None, None);
+        return (ended, None, None, true);
     };
-    (ended, items.parse().ok(), Some(size))
+    match (
+        valid_timestamp(ended),
+        items.parse::<u64>(),
+        valid_size(size),
+    ) {
+        (true, Ok(items), true) => (ended, Some(items), Some(size), false),
+        _ => (ended, None, None, true),
+    }
+}
+
+fn valid_size(value: &str) -> bool {
+    let Some(number) = ["KB", "MB", "GB", "TB", "PB", "B"]
+        .iter()
+        .find_map(|unit| value.strip_suffix(unit))
+    else {
+        return false;
+    };
+    number
+        .parse::<f64>()
+        .is_ok_and(|size| size.is_finite() && size >= 0.0)
+}
+
+fn valid_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 19
+        && [4, 7].iter().all(|index| bytes[*index] == b'-')
+        && bytes[10] == b' '
+        && [13, 16].iter().all(|index| bytes[*index] == b':')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| [4, 7, 10, 13, 16].contains(&index) || byte.is_ascii_digit())
 }
 
 fn parse_operation(line: &str) -> Option<(&str, &str, &str)> {
@@ -316,6 +397,9 @@ fn decode_field(field: &str) -> Option<String> {
             let hex = std::str::from_utf8(&bytes[index + 2..index + 4]).ok()?;
             out.push(u8::from_str_radix(hex, 16).ok()?);
             index += 4;
+        } else if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'\\') {
+            out.push(b'\\');
+            index += 2;
         } else {
             out.push(bytes[index]);
             index += 1;
@@ -334,6 +418,168 @@ pub fn append_deletion(
 ) -> io::Result<()> {
     let paths = log_paths()?;
     append_deletion_to(&paths.deletions, timestamp, mode, size_kb, status, path)
+}
+
+#[derive(Clone, Debug)]
+pub struct OpLog {
+    operations: PathBuf,
+    deletions: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct SessionSummary {
+    pub items: u64,
+    pub size: String,
+}
+
+#[derive(Debug)]
+pub struct Session {
+    operations: PathBuf,
+    command: String,
+    run_id: String,
+    ended: bool,
+}
+
+impl OpLog {
+    pub fn new() -> io::Result<Self> {
+        let paths = log_paths()?;
+        Ok(Self {
+            operations: paths.operations,
+            deletions: paths.deletions,
+        })
+    }
+
+    pub fn with_state_home(state_home: &Path) -> Self {
+        let directory = state_home.join("mole-linux");
+        Self {
+            operations: directory.join("operations.log"),
+            deletions: directory.join("deletions.log"),
+        }
+    }
+
+    pub fn start_session(&self, command: &str, dry_run: bool) -> io::Result<Session> {
+        let command = if dry_run {
+            format!("{command}-dry-run")
+        } else {
+            command.to_string()
+        };
+        let run_id = run_id()?;
+        let identity = format!("{command} run={run_id}");
+        append_line(
+            &self.operations,
+            &format!(
+                "# ========== {} session started at {} ==========",
+                escape_field(&identity),
+                timestamp()?
+            ),
+        )?;
+        Ok(Session {
+            operations: self.operations.clone(),
+            command,
+            run_id,
+            ended: false,
+        })
+    }
+
+    pub fn append_deletion(
+        &self,
+        timestamp: &str,
+        mode: &str,
+        size_kb: Option<u64>,
+        status: &str,
+        path: &str,
+    ) -> io::Result<()> {
+        append_deletion_to(&self.deletions, timestamp, mode, size_kb, status, path)
+    }
+}
+
+impl Session {
+    pub fn record(&mut self, action: &str, outcome: &str, path: &str) -> io::Result<()> {
+        if !OUTCOME_NAMES.contains(&outcome) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid operation outcome: {outcome}"),
+            ));
+        }
+        if self.ended {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot record operation after session end",
+            ));
+        }
+        let identity = format!("{} run={}", self.command, self.run_id);
+        append_line(
+            &self.operations,
+            &format!(
+                "[{}] [{}] {} {} {}",
+                timestamp()?,
+                escape_field(&identity),
+                escape_field(action),
+                escape_field(outcome),
+                escape_field(path)
+            ),
+        )
+    }
+
+    pub fn end(&mut self, summary: &SessionSummary) -> io::Result<()> {
+        if self.ended {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session already ended",
+            ));
+        }
+        let identity = format!("{} run={}", self.command, self.run_id);
+        append_line(
+            &self.operations,
+            &format!(
+                "# ========== {} session ended at {}, {} items, {} ==========",
+                escape_field(&identity),
+                timestamp()?,
+                summary.items,
+                escape_field(&summary.size)
+            ),
+        )?;
+        self.ended = true;
+        Ok(())
+    }
+}
+
+fn run_id() -> io::Result<String> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    Ok(format!("{}-{}", std::process::id(), elapsed.as_nanos()))
+}
+
+fn timestamp() -> io::Result<String> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_secs();
+    Ok(format_utc_timestamp(seconds))
+}
+
+fn format_utc_timestamp(seconds: u64) -> String {
+    let days = seconds / 86_400;
+    let day_seconds = seconds % 86_400;
+    let z = i128::from(days) + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        day_seconds / 3_600,
+        day_seconds % 3_600 / 60,
+        day_seconds % 60
+    )
 }
 
 fn append_deletion_to(
@@ -431,11 +677,19 @@ fn end_session_to(
 
 fn escape_field(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
+    let characters: Vec<char> = value.chars().collect();
+    for (index, character) in characters.iter().copied().enumerate() {
         if character.is_control() {
             for byte in character.to_string().bytes() {
                 escaped.push_str(&format!("\\x{byte:02x}"));
             }
+        } else if character == '\\'
+            && characters.get(index + 1) == Some(&'x')
+            && characters
+                .get(index + 2..index + 4)
+                .is_some_and(|digits| digits.iter().all(char::is_ascii_hexdigit))
+        {
+            escaped.push_str("\\\\");
         } else {
             escaped.push(character);
         }
@@ -443,12 +697,23 @@ fn escape_field(value: &str) -> String {
     escaped
 }
 
+/// Uses `O_APPEND` and one write call so cooperating writers append whole records.
 fn append_line(path: &Path, line: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{line}")
+    let mut record = Vec::with_capacity(line.len().saturating_add(1));
+    record.extend_from_slice(line.as_bytes());
+    record.push(b'\n');
+    let written = file.write(&record)?;
+    if written != record.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "operation log append was not written atomically",
+        ));
+    }
+    Ok(())
 }
 
 fn render_text(history: &History) {
@@ -471,11 +736,26 @@ fn render_text(history: &History) {
             session.actions.skipped,
             session.actions.failed,
             if session.ended_at.is_empty() {
-                "not ended"
+                "not ended".to_string()
             } else {
-                &session.ended_at
+                visible(&session.ended_at)
             }
         );
+        if session.failed_tasks > 0 {
+            println!(
+                "             {} optimize tasks failed",
+                session.failed_tasks
+            );
+        }
+        if session.malformed_summaries > 0 {
+            println!(
+                "             {} malformed session summaries",
+                session.malformed_summaries
+            );
+        }
+        if session.ambiguous {
+            println!("             legacy run attribution unknown run");
+        }
     }
     println!("\nDeletion audit");
     if history.deletions.is_empty() {
@@ -495,18 +775,30 @@ fn render_text(history: &History) {
     }
     println!(
         "\nLogs\n  operations: {}\n  deletions:  {}",
-        history.logs.operations, history.logs.deletions
+        visible(&history.logs.operations),
+        visible(&history.logs.deletions)
     );
 }
 
 fn visible(value: &str) -> String {
-    value.chars().flat_map(char::escape_default).collect()
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            for byte in character.to_string().bytes() {
+                escaped.push_str(&format!("\\x{byte:02x}"));
+            }
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_TAIL_BYTES, append_deletion_to, append_operation_to, end_session_to, load_deletions,
+        MAX_TAIL_BYTES, OUTCOME_NAMES, OpLog, SessionSummary, append_deletion_to, append_line,
+        append_operation_to, end_session_to, escape_field, load_deletions, load_sessions,
         read_tail, start_session_to,
     };
 
@@ -515,12 +807,13 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("large.log");
         let mut file = std::fs::File::create(&path).expect("create log");
-        for _ in 0..3 {
-            file.write_all(&vec![b'x'; 512 * 1024]).expect("write log");
-            file.write_all(b"\n").expect("write delimiter");
+        for _ in 0..120_000 {
+            file.write_all(b"operation row padding\n")
+                .expect("write log row");
         }
         let tail = read_tail(&path).expect("bounded read");
         assert!(tail.len() <= usize::try_from(MAX_TAIL_BYTES).expect("bound fits usize"));
+        assert!(tail.len() > 1_000_000);
         assert_eq!(tail.last(), Some(&b'\n'));
     }
 
@@ -545,6 +838,17 @@ mod tests {
     }
 
     #[test]
+    fn deletion_round_trip_preserves_literal_escape_looking_backslashes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("deletions.log");
+        let original = "/tmp/literal\\x41-and-tab\tend";
+        append_deletion_to(&path, "stamp", "trash", Some(1), "ok", original)
+            .expect("append deletion");
+        let entries = load_deletions(&path).expect("load log");
+        assert_eq!(entries[0].path, original);
+    }
+
+    #[test]
     fn session_writer_emits_parseable_start_actions_and_end_summary() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("operations.log");
@@ -563,6 +867,118 @@ mod tests {
         assert_eq!(sessions[0].actions.trashed, 1);
         assert_eq!(sessions[0].items, 1);
         assert_eq!(sessions[0].size, "2KB");
+    }
+
+    #[test]
+    fn public_writer_api_marks_preview_and_preserves_canonical_outcome_names() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let log = OpLog::with_state_home(directory.path());
+        let mut session = log.start_session("clean", true).expect("start preview");
+        session
+            .record("TASK_FAILED", "failed", "/tmp/path\twith-control")
+            .expect("record outcome");
+        for outcome in OUTCOME_NAMES {
+            session
+                .record("STATE", outcome, "/tmp/outcome")
+                .expect("record canonical outcome");
+        }
+        session
+            .end(&SessionSummary {
+                items: 1,
+                size: "0B".to_string(),
+            })
+            .expect("end preview");
+        let bytes = std::fs::read(directory.path().join("mole-linux/operations.log"))
+            .expect("read operations log");
+        let text = String::from_utf8(bytes).expect("UTF-8 log");
+        assert!(text.contains("[clean-dry-run run="));
+        assert!(text.contains("TASK_FAILED failed /tmp/path\\x09with-control"));
+        assert_eq!(text.lines().count(), 9);
+        assert!(
+            !text
+                .as_bytes()
+                .iter()
+                .any(|byte| *byte < 0x20 && *byte != b'\n')
+        );
+        for outcome in OUTCOME_NAMES {
+            assert!(text.contains(&format!("STATE {outcome} /tmp/outcome")));
+        }
+        let sessions = super::load_sessions(&directory.path().join("mole-linux/operations.log"))
+            .expect("load written session");
+        assert_eq!(sessions[0].command, "clean-dry-run");
+        assert_eq!(sessions[0].failed_tasks, 1);
+    }
+
+    #[test]
+    fn escaping_preserves_backslashes_and_removes_all_control_bytes() {
+        let value: String = (0_u32..=255)
+            .map(|code| char::from_u32(code).expect("valid scalar"))
+            .collect();
+        let escaped = escape_field(&value);
+        assert!(!escaped.chars().any(char::is_control));
+        assert!(escaped.contains("\\"));
+        assert!(escaped.contains("\\x00"));
+        assert!(escaped.contains("\\x7f"));
+    }
+
+    #[test]
+    fn ten_thousand_unended_runs_are_loaded_from_the_fixed_tail() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("operations.log");
+        let mut file = std::fs::File::create(&path).expect("create log");
+        for index in 0..10_000_u64 {
+            writeln!(
+                file,
+                "# ========== clean run={index} session started at 2026-10-19 10:00:00 ==========\n[2026-10-19 10:00:01] [clean run={index}] REMOVED /tmp/a-long-path-that-keeps-each-record-large-enough-{index} (1KB)"
+            )
+            .expect("write start marker");
+        }
+        drop(file);
+        let tail = read_tail(&path).expect("read fixed tail");
+        assert!(tail.len() <= usize::try_from(MAX_TAIL_BYTES).expect("bound fits usize"));
+        assert!(tail.len() > 1_000_000);
+        let sessions = load_sessions(&path).expect("parse bounded tail");
+        assert!(sessions.len() < 10_000);
+        assert!(sessions.len() > 1_000);
+    }
+
+    #[test]
+    fn concurrent_records_are_whole_lines() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("operations.log");
+        let mut threads = Vec::new();
+        for worker in 0..8 {
+            let path = path.clone();
+            threads.push(std::thread::spawn(move || {
+                for index in 0..100 {
+                    append_line(&path, &format!("worker-{worker}-record-{index}"))
+                        .expect("append whole record");
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("writer thread");
+        }
+        let text = std::fs::read_to_string(path).expect("read concurrent records");
+        let rows: Vec<_> = text.lines().collect();
+        assert_eq!(rows.len(), 800);
+        assert!(rows.iter().all(|row| {
+            let Some((worker, record)) = row.split_once("-record-") else {
+                return false;
+            };
+            worker.starts_with("worker-") && record.parse::<u16>().is_ok()
+        }));
+        assert_eq!(
+            OUTCOME_NAMES,
+            [
+                "applied",
+                "unchanged",
+                "skipped",
+                "unavailable",
+                "attention",
+                "failed"
+            ]
+        );
     }
 
     use std::io::Write;

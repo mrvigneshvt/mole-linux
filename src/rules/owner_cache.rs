@@ -1,9 +1,9 @@
-//! Owner-managed developer caches (M5.1, M5.2): npm, pnpm, bun, corepack, uv, pip3,
-//! conda. Each rule reports the directory its owner names and hands the cleanup to
+//! Owner-managed developer caches (M5.1, M5.2, M5.3): npm, pnpm, bun, corepack, uv, pip3,
+//! conda, go, mise. Each rule reports the directory its owner names and hands the cleanup to
 //! the owner's own command through the shared runner.
 // Ported from tw93/Mole lib/clean/dev.sh: clean_dev_npm, clean_pnpm_stores,
-// clean_corepack_cache, the bun block, clean_uv_cache, clean_dev_python (pip3),
-// and clean_conda_metadata_caches (GPL-3.0).
+// clean_corepack_cache, clean_dev_go, clean_dev_mise, the bun block, clean_uv_cache,
+// clean_dev_python (pip3), and clean_conda_metadata_caches (GPL-3.0).
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::{env, io};
 
 use crate::adapters::{
-    AdapterEnv, Bun, Conda, Corepack, Npm, OwnerAdapter, Pip, Pnpm, Uv, resolve,
+    AdapterEnv, Bun, Conda, Corepack, Go, Mise, Npm, OwnerAdapter, Pip, Pnpm, Uv, resolve,
 };
 use crate::core::proc::{self, ProcessState};
 
@@ -33,6 +33,8 @@ pub struct OwnerRuleEnv {
     pub corepack_home: Option<OsString>,
     pub bun_install_cache_dir: Option<OsString>,
     pub bun_install: Option<OsString>,
+    pub mise_cache_dir: Option<OsString>,
+    pub cargo_home: Option<OsString>,
 }
 
 impl OwnerRuleEnv {
@@ -43,6 +45,8 @@ impl OwnerRuleEnv {
             corepack_home: env::var_os("COREPACK_HOME"),
             bun_install_cache_dir: env::var_os("BUN_INSTALL_CACHE_DIR"),
             bun_install: env::var_os("BUN_INSTALL"),
+            mise_cache_dir: env::var_os("MISE_CACHE_DIR"),
+            cargo_home: env::var_os("CARGO_HOME"),
         }
     }
 }
@@ -57,6 +61,8 @@ pub fn registered_with(env: OwnerRuleEnv) -> Vec<Box<dyn CleanRule>> {
         Box::new(Uv),
         Box::new(Pip),
         Box::new(Conda),
+        Box::new(Go),
+        Box::new(Mise),
     ];
     adapters
         .into_iter()
@@ -85,6 +91,7 @@ impl OwnerCacheRule {
             corepack_home: self.env.corepack_home.clone(),
             bun_install_cache_dir: self.env.bun_install_cache_dir.clone(),
             bun_install: self.env.bun_install.clone(),
+            mise_cache_dir: self.env.mise_cache_dir.clone(),
         }
     }
 

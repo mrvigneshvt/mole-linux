@@ -168,6 +168,23 @@ const CMDLINE_LIMIT: u64 = 64 * 1024;
 /// argv[1] catches node-wrapped owners (`node .../pnpm.cjs`) without matching a lockfile or an
 /// argument that merely mentions the name. Unreadable entries stay unknown unless a match is found.
 pub fn is_command_running(proc_root: &Path, names: &[&str]) -> ProcessState {
+    scan_cmdlines(proc_root, |cmdline| argv_names_command(cmdline, names))
+}
+
+/// Reports whether any process's full argv contains one of `needles`, as `pgrep -f` does.
+/// Unreadable entries stay unknown unless a match is found.
+pub fn is_cmdline_containing(proc_root: &Path, needles: &[&str]) -> ProcessState {
+    scan_cmdlines(proc_root, |cmdline| {
+        needles.iter().any(|needle| {
+            !needle.is_empty()
+                && cmdline
+                    .windows(needle.len())
+                    .any(|window| window == needle.as_bytes())
+        })
+    })
+}
+
+fn scan_cmdlines(proc_root: &Path, matches: impl Fn(&[u8]) -> bool) -> ProcessState {
     let entries = match fs::read_dir(proc_root) {
         Ok(entries) => entries,
         Err(_) => return ProcessState::Unknown,
@@ -201,7 +218,7 @@ pub fn is_command_running(proc_root: &Path, names: &[&str]) -> ProcessState {
             unknown = true;
             continue;
         }
-        if argv_names_command(&cmdline, names) {
+        if matches(&cmdline) {
             return ProcessState::Running;
         }
         // A truncated argv may hide argv[1]; absence is then unproven.

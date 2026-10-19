@@ -1,5 +1,7 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,4 +102,66 @@ pub fn is_process_name_running(proc_root: &Path, expected: &str) -> ProcessState
     } else {
         ProcessState::NotRunning
     }
+}
+
+const CMDLINE_LIMIT: u64 = 64 * 1024;
+
+/// Reports whether a process runs one of `names`, judged by the basenames of argv[0] and argv[1].
+/// argv[1] catches node-wrapped owners (`node .../pnpm.cjs`) without matching a lockfile or an
+/// argument that merely mentions the name. Unreadable entries stay unknown unless a match is found.
+pub fn is_command_running(proc_root: &Path, names: &[&str]) -> ProcessState {
+    let entries = match fs::read_dir(proc_root) {
+        Ok(entries) => entries,
+        Err(_) => return ProcessState::Unknown,
+    };
+    let mut unknown = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                unknown = true;
+                continue;
+            }
+        };
+        if entry
+            .file_name()
+            .to_str()
+            .is_none_or(|name| !name.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        let file = match fs::File::open(entry.path().join("cmdline")) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                unknown = true;
+                continue;
+            }
+        };
+        let mut cmdline = Vec::new();
+        if file.take(CMDLINE_LIMIT).read_to_end(&mut cmdline).is_err() {
+            unknown = true;
+            continue;
+        }
+        if argv_names_command(&cmdline, names) {
+            return ProcessState::Running;
+        }
+        // A truncated argv may hide argv[1]; absence is then unproven.
+        if u64::try_from(cmdline.len()).is_ok_and(|len| len >= CMDLINE_LIMIT) {
+            unknown = true;
+        }
+    }
+    if unknown {
+        ProcessState::Unknown
+    } else {
+        ProcessState::NotRunning
+    }
+}
+
+fn argv_names_command(cmdline: &[u8], names: &[&str]) -> bool {
+    cmdline.split(|byte| *byte == 0).take(2).any(|arg| {
+        Path::new(OsStr::from_bytes(arg))
+            .file_name()
+            .is_some_and(|base| names.iter().any(|name| base == OsStr::new(name)))
+    })
 }

@@ -86,3 +86,8 @@ target-file	.bun/install/cache/mole-linux-bun-fixture
 target-file	.cache/node/corepack/mole-linux-corepack-fixture
 canary	.npmrc
 canary	.cache/node/keep-canary
+target-file	.cache/uv/mole-linux-uv-fixture
+target-file	.conda/pkgs/mole-linux-conda-fixture
+target-file	.local/share/pyinstaller/bincache00_py311/mole-linux-pyinstaller-fixture
+canary	.local/share/pyinstaller/config.json
+target-file	.cache/ruff/0.9.1/mole-linux-ruff-fixture

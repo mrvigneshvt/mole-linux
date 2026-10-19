@@ -1,15 +1,18 @@
-//! Owner-managed developer caches (M5.1): npm, pnpm, bun, corepack. Each rule
-//! reports the directory its owner names and hands the cleanup to the owner's
-//! own command through the shared runner.
+//! Owner-managed developer caches (M5.1, M5.2): npm, pnpm, bun, corepack, uv, pip3,
+//! conda. Each rule reports the directory its owner names and hands the cleanup to
+//! the owner's own command through the shared runner.
 // Ported from tw93/Mole lib/clean/dev.sh: clean_dev_npm, clean_pnpm_stores,
-// clean_corepack_cache, and the bun block (GPL-3.0).
+// clean_corepack_cache, the bun block, clean_uv_cache, clean_dev_python (pip3),
+// and clean_conda_metadata_caches (GPL-3.0).
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::{env, io};
 
-use crate::adapters::{AdapterEnv, Bun, Corepack, Npm, OwnerAdapter, Pnpm, resolve};
+use crate::adapters::{
+    AdapterEnv, Bun, Conda, Corepack, Npm, OwnerAdapter, Pip, Pnpm, Uv, resolve,
+};
 use crate::core::proc::{self, ProcessState};
 
 use super::clean::{
@@ -51,6 +54,9 @@ pub fn registered_with(env: OwnerRuleEnv) -> Vec<Box<dyn CleanRule>> {
         Box::new(Pnpm),
         Box::new(Bun),
         Box::new(Corepack),
+        Box::new(Uv),
+        Box::new(Pip),
+        Box::new(Conda),
     ];
     adapters
         .into_iter()
@@ -119,6 +125,7 @@ impl CleanRule for OwnerCacheRule {
         let mut issues = Vec::new();
         let mut seen = BTreeSet::new();
         let mut owner_refused = false;
+        let mut protected = Vec::new();
         for result in results {
             let resolved = match result {
                 Ok(resolved) => resolved,
@@ -128,6 +135,18 @@ impl CleanRule for OwnerCacheRule {
                     continue;
                 }
             };
+            // A whitelisted directory anywhere under the owner's cleanup keeps the owner command from running.
+            if let Some(kept) = resolved
+                .guarded
+                .iter()
+                .find(|path| ctx.whitelist.matches(path))
+            {
+                protected.push(format!(
+                    "{} is whitelisted; owner command skipped",
+                    kept.display()
+                ));
+                continue;
+            }
             // Two binaries that name one store get one candidate, so the owner runs once.
             if !seen.insert(resolved.target.clone()) {
                 continue;
@@ -176,6 +195,7 @@ impl CleanRule for OwnerCacheRule {
                 status: DiscoveryStatus::Unavailable(issues.join("; ")),
             };
         }
+        issues.extend(protected);
         let status = if issues.is_empty() {
             DiscoveryStatus::Complete
         } else {

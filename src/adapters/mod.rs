@@ -4,9 +4,12 @@
 //! sizing, and accounting.
 
 mod bun;
+mod conda;
 mod corepack;
 mod npm;
+mod pip;
 mod pnpm;
+mod uv;
 
 use std::env::split_paths;
 use std::ffi::{OsStr, OsString};
@@ -23,9 +26,12 @@ use crate::core::proc::{self, ProcessState};
 use crate::rules::clean::OwnerAction;
 
 pub use bun::Bun;
+pub use conda::Conda;
 pub use corepack::Corepack;
 pub use npm::Npm;
+pub use pip::Pip;
 pub use pnpm::Pnpm;
+pub use uv::Uv;
 
 /// Owner tools that show a download prompt would hang a section until its timeout.
 const NO_DOWNLOAD_PROMPT: (&str, &str) = ("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
@@ -51,11 +57,13 @@ pub struct AdapterEnv {
     pub bun_install: Option<OsString>,
 }
 
-/// A usable binary and the cache directory its owner reports.
+/// A usable binary, the cache directory its owner reports, and every directory its cleanup may change.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Resolved {
     pub binary: PathBuf,
     pub target: PathBuf,
+    /// Includes `target`. Whitelisting any of these keeps the owner command from running.
+    pub guarded: Vec<PathBuf>,
 }
 
 /// Why an adapter cannot use a binary or name a target. `outcome` says whether the tool is absent or the path refused.
@@ -82,6 +90,11 @@ pub trait OwnerAdapter: Send + Sync {
     }
     /// The cache directory the owner reports for this binary.
     fn target(&self, binary: &Path, env: &AdapterEnv) -> Result<PathBuf, Refusal>;
+    /// Every directory the owner command may change, previewed target first. Owners that clean
+    /// several roots (conda) override this; `resolve` uses it so the query runs once.
+    fn targets(&self, binary: &Path, env: &AdapterEnv) -> Result<Vec<PathBuf>, Refusal> {
+        self.target(binary, env).map(|target| vec![target])
+    }
     /// Owner command arguments that perform the cleanup.
     fn clean_args(&self) -> &'static [&'static str];
     /// Extra fact shown with the candidate, when the owner's command does less than its size suggests.
@@ -145,8 +158,16 @@ fn resolve_one(
             reason: format!("--version failed: {}", error.describe()),
         });
     }
-    let target = adapter.target(&binary, env)?;
-    Ok(Resolved { binary, target })
+    let guarded = adapter.targets(&binary, env)?;
+    let target = guarded.first().cloned().ok_or_else(|| Refusal {
+        outcome: Outcome::Unavailable,
+        reason: format!("{} reported no cache directory", adapter.program()),
+    })?;
+    Ok(Resolved {
+        binary,
+        target,
+        guarded,
+    })
 }
 
 /// Runs one owner cleanup command. Returns the outcome and a short reason.

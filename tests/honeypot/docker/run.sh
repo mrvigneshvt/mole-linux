@@ -37,7 +37,7 @@ if [[ "$scenario" == analyze-delete ]]; then
         printf 'missing analyze-delete integration test binary; run cargo test --test analyze_delete first\n' >&2
         exit 1
     fi
-    docker_args+=(--cap-add SYS_ADMIN --mount "type=bind,src=$test_binary,dst=/usr/local/bin/analyze-delete-tests,readonly")
+    docker_args+=(--cap-add SYS_ADMIN --security-opt apparmor=unconfined --mount "type=bind,src=$test_binary,dst=/usr/local/bin/analyze-delete-tests,readonly")
 fi
 if [[ "$scenario" == privilege-sudo ]]; then
     test_binary=

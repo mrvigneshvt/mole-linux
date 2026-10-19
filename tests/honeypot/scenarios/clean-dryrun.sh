@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-binary=${1:?pass the mole-linux binary path}
+binary=${1:-mole-linux}
 "$binary" clean --dry-run

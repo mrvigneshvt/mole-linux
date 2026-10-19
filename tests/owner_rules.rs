@@ -6,6 +6,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use mole_linux::commands::clean::{self, CleanArgs, CleanSummary};
@@ -135,8 +136,17 @@ fn select(names: &str) -> CleanArgs {
     }
 }
 
+/// Shim tests in one binary run one at a time. A sibling test's fork can hold a freshly written
+/// shim open for write, and exec then fails with ETXTBSY ("Text file busy").
+static SHIM_SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SHIM_SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[test]
 fn catalog_registers_the_four_js_owner_rules_in_development() {
+    let _serial = serial();
     let rules = catalog();
     for id in ["npm", "pnpm", "bun", "corepack"] {
         let rule = rules
@@ -149,6 +159,7 @@ fn catalog_registers_the_four_js_owner_rules_in_development() {
 
 #[test]
 fn dry_run_reports_the_owner_cache_and_runs_no_owner_command() {
+    let _serial = serial();
     let s = sandbox();
     seed_cache(&s.home.join(".npm"));
     write_shim(
@@ -175,6 +186,7 @@ fn dry_run_reports_the_owner_cache_and_runs_no_owner_command() {
 
 #[test]
 fn apply_runs_the_owner_clean_once_and_keeps_the_runner_accounting() {
+    let _serial = serial();
     let s = sandbox();
     seed_cache(&s.home.join(".npm"));
     write_shim(
@@ -199,6 +211,7 @@ fn apply_runs_the_owner_clean_once_and_keeps_the_runner_accounting() {
 
 #[test]
 fn select_runs_only_the_named_owner_rule() {
+    let _serial = serial();
     let s = sandbox();
     seed_cache(&s.home.join(".npm"));
     seed_cache(&s.home.join(".local/share/pnpm/store/v11"));
@@ -226,6 +239,7 @@ fn select_runs_only_the_named_owner_rule() {
 
 #[test]
 fn running_owner_is_gated_by_the_runner_and_never_cleaned() {
+    let _serial = serial();
     let s = sandbox();
     seed_cache(&s.home.join(".npm"));
     write_shim(
@@ -245,6 +259,7 @@ fn running_owner_is_gated_by_the_runner_and_never_cleaned() {
 
 #[test]
 fn unknown_process_state_is_unavailable_and_never_cleaned() {
+    let _serial = serial();
     let s = sandbox();
     seed_cache(&s.home.join(".npm"));
     write_shim(
@@ -264,6 +279,7 @@ fn unknown_process_state_is_unavailable_and_never_cleaned() {
 
 #[test]
 fn missing_bun_is_unavailable_and_nothing_else_runs() {
+    let _serial = serial();
     let s = sandbox();
     fs::create_dir_all(&s.bin).expect("empty PATH");
     let summary = run(&s, select("bun"));
@@ -273,6 +289,7 @@ fn missing_bun_is_unavailable_and_nothing_else_runs() {
 
 #[test]
 fn bun_query_failure_never_runs_the_owner_rm() {
+    let _serial = serial();
     let s = sandbox();
     seed_cache(&s.home.join(".bun/install/cache"));
     write_shim(
@@ -289,6 +306,7 @@ fn bun_query_failure_never_runs_the_owner_rm() {
 
 #[test]
 fn bun_reported_cache_is_sized_and_cleared_with_its_own_rm() {
+    let _serial = serial();
     let s = sandbox();
     let cache = s.home.join(".bun/install/cache");
     seed_cache(&cache);
@@ -317,6 +335,7 @@ fn bun_reported_cache_is_sized_and_cleared_with_its_own_rm() {
 
 #[test]
 fn failing_owner_clean_counts_as_failed_not_applied() {
+    let _serial = serial();
     let s = sandbox();
     seed_cache(&s.home.join(".npm"));
     write_shim(
@@ -334,6 +353,7 @@ fn failing_owner_clean_counts_as_failed_not_applied() {
 
 #[test]
 fn two_pnpm_binaries_on_one_store_prune_it_once() {
+    let _serial = serial();
     let s = sandbox();
     let store = s.home.join(".local/share/pnpm/store/v11");
     seed_cache(&store);
@@ -351,6 +371,7 @@ fn two_pnpm_binaries_on_one_store_prune_it_once() {
 
 #[test]
 fn missing_corepack_is_unavailable_and_its_cache_survives() {
+    let _serial = serial();
     let s = sandbox();
     let cache = s.home.join(".cache/node/corepack");
     seed_cache(&cache);
@@ -365,6 +386,7 @@ fn missing_corepack_is_unavailable_and_its_cache_survives() {
 
 #[test]
 fn owner_gating_is_rechecked_before_the_owner_command() {
+    let _serial = serial();
     let s = sandbox();
     seed_cache(&s.home.join(".npm"));
     write_shim(
@@ -425,6 +447,7 @@ fn discover_with(s: &Sandbox, env: OwnerRuleEnv, id: &str) -> mole_linux::rules:
 
 #[test]
 fn bun_that_cannot_run_falls_back_to_its_cache_dir_sent_to_trash() {
+    let _serial = serial();
     let s = sandbox();
     let cache = s.home.join(".bun/install/cache");
     seed_cache(&cache);
@@ -455,6 +478,7 @@ fn bun_that_cannot_run_falls_back_to_its_cache_dir_sent_to_trash() {
 
 #[test]
 fn bun_fallback_dry_run_selects_without_moving_anything() {
+    let _serial = serial();
     let s = sandbox();
     let cache = s.home.join(".bun/install/cache");
     seed_cache(&cache);
@@ -480,6 +504,7 @@ fn bun_fallback_dry_run_selects_without_moving_anything() {
 
 #[test]
 fn bun_fallback_is_not_offered_while_bun_runs() {
+    let _serial = serial();
     let s = sandbox();
     let cache = s.home.join(".bun/install/cache");
     seed_cache(&cache);
@@ -502,6 +527,7 @@ fn bun_fallback_is_not_offered_while_bun_runs() {
 
 #[test]
 fn bun_fallback_dir_follows_bun_install_cache_dir_then_bun_install() {
+    let _serial = serial();
     let s = sandbox();
     write_shim(
         &s.home,

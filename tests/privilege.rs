@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use mole_linux::core::outcome::Outcome;
 use mole_linux::core::privilege::{
@@ -40,7 +41,13 @@ fn read_log(log: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Shim tests in one binary run one at a time. A sibling test's fork can hold a freshly written
+/// shim open for write, and exec then fails with ETXTBSY ("Text file busy"). Other binaries are
+/// separate processes and never share that descriptor, so only same-binary tests need this.
+static SHIM_SERIAL: Mutex<()> = Mutex::new(());
+
 struct Fixture {
+    _serial: MutexGuard<'static, ()>,
     _temp: tempfile::TempDir,
     bin: PathBuf,
     sudo_dir: PathBuf,
@@ -48,9 +55,11 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    let serial = SHIM_SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().to_path_buf();
     Fixture {
+        _serial: serial,
         bin: root.join("usr-bin"),
         sudo_dir: root.join("sudo-bin"),
         log: root.join("calls.log"),

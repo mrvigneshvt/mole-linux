@@ -6,6 +6,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use mole_linux::commands::clean::{CleanArgs, CleanSummary, execute_rules_with_owner};
@@ -19,6 +20,14 @@ use mole_linux::rules::clean::{
     Category, CleanRule, Discovery, DiscoveryStatus, OwnerCheck, RecoveryMode, RuleContext, catalog,
 };
 use mole_linux::rules::system::{PaccacheRule, YayBuildRule};
+
+/// Shim tests in one binary run one at a time. A sibling test's fork can hold a freshly written
+/// shim open for write, and exec then fails with ETXTBSY ("Text file busy").
+static SHIM_SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SHIM_SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Writes an executable shell script that logs `name<TAB>argv...` to `log`, then runs `body`.
 fn write_shim(dir: &Path, name: &str, log: &Path, body: &str) -> PathBuf {
@@ -92,6 +101,7 @@ const TWO_CANDIDATES: &str = "==> finished dry run: 2 candidates (disk space sav
 
 #[test]
 fn owner_query_returns_stdout_for_unprivileged_queries_without_sudo() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let bin = temp.path().join("usr-bin");
     let log = temp.path().join("calls.log");
@@ -110,6 +120,7 @@ fn owner_query_returns_stdout_for_unprivileged_queries_without_sudo() {
 
 #[test]
 fn owner_query_refuses_root_commands_and_missing_tools() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let bin = temp.path().join("usr-bin");
     let log = temp.path().join("calls.log");
@@ -139,6 +150,7 @@ fn owner_query_refuses_root_commands_and_missing_tools() {
 
 #[test]
 fn keep_three_discovery_reports_one_owner_action_from_the_preview() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let cache = temp.path().join("pkg");
@@ -176,6 +188,7 @@ fn keep_three_discovery_reports_one_owner_action_from_the_preview() {
 
 #[test]
 fn keep_three_discovery_with_no_candidates_is_complete_and_empty() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let cache = temp.path().join("pkg");
@@ -199,6 +212,7 @@ fn keep_three_discovery_with_no_candidates_is_complete_and_empty() {
 
 #[test]
 fn unrecognised_preview_output_is_unavailable_never_zero() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let cache = temp.path().join("pkg");
@@ -222,6 +236,7 @@ fn unrecognised_preview_output_is_unavailable_never_zero() {
 
 #[test]
 fn missing_paccache_is_unavailable_for_both_pacman_rules() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let cache = temp.path().join("pkg");
@@ -254,6 +269,7 @@ fn missing_paccache_is_unavailable_for_both_pacman_rules() {
 
 #[test]
 fn apply_runs_keep_three_through_sudo_after_one_consent_with_exact_argv() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let cache = temp.path().join("pkg");
@@ -317,6 +333,7 @@ fn apply_runs_keep_three_through_sudo_after_one_consent_with_exact_argv() {
 
 #[test]
 fn declined_consent_runs_no_sudo_and_reports_skipped() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let cache = temp.path().join("pkg");
@@ -360,6 +377,7 @@ fn declined_consent_runs_no_sudo_and_reports_skipped() {
 
 #[test]
 fn dry_run_previews_owner_action_without_prompt_or_execution() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let cache = temp.path().join("pkg");
@@ -403,6 +421,7 @@ fn dry_run_previews_owner_action_without_prompt_or_execution() {
 
 #[test]
 fn owner_actions_are_opt_in_and_never_prompt_without_an_explicit_select() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let cache = temp.path().join("pkg");
@@ -444,6 +463,7 @@ fn owner_actions_are_opt_in_and_never_prompt_without_an_explicit_select() {
 
 #[test]
 fn category_select_opts_into_owner_actions() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let cache = temp.path().join("pkg");
@@ -485,6 +505,7 @@ fn category_select_opts_into_owner_actions() {
 
 #[test]
 fn owner_runner_exposes_the_exact_argv_it_would_execute() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let bin = temp.path().join("usr-bin");
     let sudo = temp.path().join("sudo-bin/sudo");
@@ -504,6 +525,7 @@ fn owner_runner_exposes_the_exact_argv_it_would_execute() {
 
 #[test]
 fn yay_build_dirs_without_git_are_candidates_and_git_checkouts_are_kept() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let cache = home.join(".cache/yay");
@@ -532,6 +554,7 @@ fn yay_build_dirs_without_git_are_candidates_and_git_checkouts_are_kept() {
 
 #[test]
 fn yay_build_dir_apply_moves_to_trash_through_the_sink_only() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let cache = home.join(".cache/yay");
@@ -575,6 +598,7 @@ fn yay_build_dir_apply_moves_to_trash_through_the_sink_only() {
 
 #[test]
 fn system_catalog_registers_pacman_and_aur_rules_in_the_system_category() {
+    let _serial = serial();
     let rules = catalog();
     let system: Vec<&str> = rules
         .iter()
@@ -587,13 +611,15 @@ fn system_catalog_registers_pacman_and_aur_rules_in_the_system_category() {
         vec![
             "pacman-cache-keep3",
             "pacman-cache-uninstalled",
-            "aur-build-dirs"
+            "aur-build-dirs",
+            "journal",
         ]
     );
 }
 
 #[test]
 fn discovery_defaults_do_not_need_an_owner_runner_for_plain_rules() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     fs::create_dir_all(&home).expect("home");

@@ -2,6 +2,14 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::statvfs;
+
+/// Free bytes available to unprivileged users on the filesystem holding `path`.
+pub fn available_bytes(path: &Path) -> io::Result<u128> {
+    let stats = statvfs(path).map_err(io::Error::from)?;
+    Ok(u128::from(stats.f_bavail) * u128::from(stats.f_frsize))
+}
+
 /// Resolve every symlink in the final path while allowing a missing, unlinked target.
 pub fn resolve_symlink_chain(path: &Path) -> io::Result<PathBuf> {
     let mut current = path.to_path_buf();

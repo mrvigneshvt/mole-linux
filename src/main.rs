@@ -257,13 +257,15 @@ fn run() -> io::Result<()> {
             external: args.external,
             whitelist: args.whitelist,
         }),
-        Command::Purge(_) => not_implemented("purge", 31),
         Command::Installer(args) => mole_linux::commands::installer::run(
             args.dry_run,
             args.max_depth,
             args.hidden,
             args.r#type.as_deref(),
         ),
+        Command::Purge(args) => {
+            mole_linux::commands::purge::run(args.dry_run, args.paths, args.include_empty, args.yes)
+        }
         Command::Uninstall(args) => {
             if args.list {
                 mole_linux::commands::uninstall::run_list()

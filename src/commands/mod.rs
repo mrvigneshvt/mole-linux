@@ -3,6 +3,7 @@ pub mod clean;
 pub mod installer;
 pub mod journal;
 pub mod optimize;
+pub mod purge;
 pub mod snapshots;
 pub mod status;
 pub mod uninstall;

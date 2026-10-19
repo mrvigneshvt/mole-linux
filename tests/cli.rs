@@ -15,14 +15,30 @@ fn unsupported_subcommands_parse_flags_and_exit_two() {
     let cases: &[(&[&str], u32)] = &[
         (
             &[
-                "purge",
+                "clean",
                 "--dry-run",
-                "--paths",
-                "target",
-                "--include-empty",
-                "--yes",
+                "--categories",
+                "cache",
+                "--select",
+                "one",
+                "--exclude",
+                "two",
+                "--external",
+                "--whitelist",
             ],
-            31,
+            16,
+        ),
+        (
+            &[
+                "installer",
+                "--dry-run",
+                "--max-depth",
+                "2",
+                "--hidden",
+                "--type",
+                "zip",
+            ],
+            33,
         ),
         (
             &["uninstall", "--dry-run", "--permanent", "--whitelist"],

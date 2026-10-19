@@ -246,6 +246,7 @@ pub fn catalog() -> Vec<Box<dyn CleanRule>> {
     let mut rules: Vec<Box<dyn CleanRule>> = vec![
         Box::new(PaccacheRule::keep_three(PathBuf::from(PACMAN_CACHE_DIR))),
         Box::new(PaccacheRule::uninstalled(PathBuf::from(PACMAN_CACHE_DIR))),
+        Box::new(super::orphans::OrphanPackagesRule),
     ];
     if let Some(xdg) = XdgPaths::from_env() {
         rules.push(Box::new(YayBuildRule::new(xdg.cache.join("yay"))));

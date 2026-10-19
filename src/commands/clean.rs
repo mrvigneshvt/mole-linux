@@ -20,7 +20,7 @@ use crate::core::sink::{DeleteMode, Identity, SinkContext, delete};
 use crate::core::validate::validate_path_for_deletion;
 use crate::core::whitelist::Whitelist;
 use crate::rules::clean::{
-    Candidate, Category, CleanRule, DiscoveryStatus, RecoveryMode, RuleContext, catalog,
+    Candidate, Category, CleanRule, DiscoveryStatus, RecoveryMode, Report, RuleContext, catalog,
 };
 use crate::scan::{self, Node, NodeStatus};
 
@@ -225,6 +225,9 @@ pub fn execute_rules_with_owner(
         }
         for candidate in discovery.candidates {
             candidates.push((id.to_owned(), candidate));
+        }
+        if let Some(report) = rule.report_with_owner(context, owner) {
+            record_report(&mut summary, category, report);
         }
     }
     deduplicate_candidates(&mut candidates);
@@ -653,6 +656,27 @@ fn record_outcome(summary: &mut CleanSummary, outcome: &str) {
         _ => &mut summary.failed,
     };
     *counter = counter.saturating_add(1);
+}
+
+/// Reports never enter the apply list. Findings print and count once as `attention`.
+fn record_report(summary: &mut CleanSummary, category: Category, report: Report) {
+    match report {
+        Report::Clear => record_outcome(summary, "unchanged"),
+        Report::Findings(lines) => {
+            for line in &lines {
+                println!("{}: {}", category.as_str(), escape_text(line));
+            }
+            record_outcome(summary, "attention");
+        }
+        Report::Unavailable(reason) => {
+            println!(
+                "{}: unavailable ({})",
+                category.as_str(),
+                escape_text(&reason)
+            );
+            record_outcome(summary, "unavailable");
+        }
+    }
 }
 
 fn record(

@@ -24,6 +24,23 @@ pub fn validate_path_for_deletion(
     home: &Path,
     xdg: &XdgPaths,
 ) -> Result<(), ValidationError> {
+    validate_path_for_deletion_inner(path, home, xdg, true)
+}
+
+pub(crate) fn validate_path_for_sink(
+    path: &Path,
+    home: &Path,
+    xdg: &XdgPaths,
+) -> Result<(), ValidationError> {
+    validate_path_for_deletion_inner(path, home, xdg, false)
+}
+
+fn validate_path_for_deletion_inner(
+    path: &Path,
+    home: &Path,
+    xdg: &XdgPaths,
+    check_whitelist: bool,
+) -> Result<(), ValidationError> {
     // Ported from tw93/Mole lib/core/file_ops.sh:validate_path_for_deletion (GPL-3.0).
     if path.as_os_str().is_empty() {
         return Err(ValidationError::Empty);
@@ -46,7 +63,7 @@ pub fn validate_path_for_deletion(
         return Err(ValidationError::ParentTraversal);
     }
 
-    check_policy(&normalized, home, xdg)?;
+    check_policy(&normalized, home, xdg, check_whitelist)?;
     let canonical_home = home
         .canonicalize()
         .map_err(|_| ValidationError::Unverifiable(home.to_path_buf()))?;
@@ -58,7 +75,7 @@ pub fn validate_path_for_deletion(
                 return Err(ValidationError::OutsideHome);
             }
             if resolved_parent != parent {
-                match check_policy(&resolved, home, xdg) {
+                match check_policy(&resolved, home, xdg, check_whitelist) {
                     Ok(()) => {}
                     Err(error @ ValidationError::Unverifiable(_)) => return Err(error),
                     Err(_) => {
@@ -75,7 +92,7 @@ pub fn validate_path_for_deletion(
 
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => match path.canonicalize() {
-            Ok(resolved) if check_policy(&resolved, home, xdg).is_err() => {
+            Ok(resolved) if check_policy(&resolved, home, xdg, check_whitelist).is_err() => {
                 return Err(ValidationError::SymlinkTargetProtected {
                     path: path.to_path_buf(),
                     resolved,
@@ -95,7 +112,12 @@ fn is_strict_descendant(path: &Path, parent: &Path) -> bool {
     path != parent && path.starts_with(parent)
 }
 
-fn check_policy(path: &Path, home: &Path, xdg: &XdgPaths) -> Result<(), ValidationError> {
+fn check_policy(
+    path: &Path,
+    home: &Path,
+    xdg: &XdgPaths,
+    check_whitelist: bool,
+) -> Result<(), ValidationError> {
     let normalized = lexical_normalize(path);
     let critical = [
         "/", "/bin", "/sbin", "/lib", "/lib64", "/usr", "/etc", "/boot", "/var", "/opt", "/srv",
@@ -161,10 +183,12 @@ fn check_policy(path: &Path, home: &Path, xdg: &XdgPaths) -> Result<(), Validati
     {
         return Err(ValidationError::Protected(normalized));
     }
-    let whitelist =
-        Whitelist::load(xdg).map_err(|_| ValidationError::Unverifiable(Whitelist::path(xdg)))?;
-    if whitelist.is_whitelisted(&normalized) {
-        return Err(ValidationError::Protected(normalized));
+    if check_whitelist {
+        let whitelist = Whitelist::load(xdg)
+            .map_err(|_| ValidationError::Unverifiable(Whitelist::path(xdg)))?;
+        if whitelist.is_whitelisted(&normalized) {
+            return Err(ValidationError::Protected(normalized));
+        }
     }
     Ok(())
 }

@@ -13,7 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rustix::fs::{self as rfs, AtFlags, Mode as FileMode, OFlags, RenameFlags, StatxFlags};
 
 use super::paths::XdgPaths;
-use super::validate::{ValidationError, validate_path_for_deletion};
+use super::validate::{ValidationError, validate_path_for_sink};
+use super::whitelist::Whitelist;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -89,6 +90,23 @@ pub enum DeleteMode {
     Permanent,
 }
 
+pub struct SinkContext {
+    home: PathBuf,
+    xdg: XdgPaths,
+    whitelist: Whitelist,
+}
+
+impl SinkContext {
+    pub fn new(xdg: XdgPaths, whitelist: Whitelist) -> Self {
+        let home = xdg.home.clone();
+        Self {
+            home,
+            xdg,
+            whitelist,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Identity {
     device: u64,
@@ -123,6 +141,7 @@ impl Identity {
 pub enum DeleteError {
     InvalidPath(ValidationError),
     IdentityChanged,
+    Whitelisted,
     Cancelled,
     Partial(io::Error),
     MountIdUnavailable,
@@ -136,6 +155,7 @@ impl std::fmt::Display for DeleteError {
         match self {
             Self::InvalidPath(error) => write!(f, "path rejected by deletion policy: {error:?}"),
             Self::IdentityChanged => f.write_str("target identity changed after preview; skipped"),
+            Self::Whitelisted => f.write_str("target or descendant is protected by the whitelist"),
             Self::Cancelled => f.write_str("batch cancelled before this item"),
             Self::Partial(error) => write!(f, "partial permanent removal: {error}"),
             Self::MountIdUnavailable => {
@@ -165,12 +185,15 @@ pub fn delete(
     path: &Path,
     expected: &Identity,
     mode: DeleteMode,
-    home: &Path,
-    xdg: &XdgPaths,
+    context: &SinkContext,
 ) -> Result<PathBuf, DeleteError> {
-    validate_path_for_deletion(path, home, xdg).map_err(DeleteError::InvalidPath)?;
+    validate_path_for_sink(path, &context.home, &context.xdg).map_err(DeleteError::InvalidPath)?;
     if !expected.matches(path).map_err(DeleteError::Io)? {
         return Err(DeleteError::IdentityChanged);
+    }
+    let resolved = path.canonicalize().map_err(DeleteError::Io)?;
+    if context.whitelist.matches(path) || context.whitelist.matches(&resolved) {
+        return Err(DeleteError::Whitelisted);
     }
     if mode == DeleteMode::DryRun {
         return Ok(path.to_path_buf());
@@ -206,7 +229,7 @@ pub fn delete(
 
     match mode {
         DeleteMode::DryRun => Ok(path.to_path_buf()),
-        DeleteMode::Trash => move_to_trash(path, name, &parent_fd, home, expected),
+        DeleteMode::Trash => move_to_trash(path, name, &parent_fd, &context.home, expected),
         DeleteMode::Permanent => {
             if current.st_mode & 0o170000 == 0o040000 {
                 let root_mount_id = require_mount_id(expected.mount_id)?;
@@ -300,8 +323,7 @@ fn remove_tree(directory: &OwnedFd, device: u64, mount_id: u64) -> Result<(), De
 pub fn delete_batch<F>(
     mut entries: Vec<(PathBuf, Identity)>,
     mode: DeleteMode,
-    home: &Path,
-    xdg: &XdgPaths,
+    context: &SinkContext,
     mut cancelled: F,
 ) -> Vec<(PathBuf, Result<PathBuf, DeleteError>)>
 where
@@ -318,7 +340,7 @@ where
             }
             break;
         }
-        results.push((path.clone(), delete(&path, &identity, mode, home, xdg)));
+        results.push((path.clone(), delete(&path, &identity, mode, context)));
     }
     results
 }

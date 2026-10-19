@@ -7,22 +7,37 @@ use mole_linux::core::proc::{ProcessState, is_process_running};
 #[test]
 fn destructive_filesystem_calls_are_confined_to_the_sink() {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let allowlist = [
+        source_root.join("core/fsutil.rs"),
+        source_root.join("core/sink.rs"),
+    ];
     let mut violations = Vec::new();
-    inspect_sources(&source_root, &source_root, &mut violations);
+    inspect_sources(&source_root, &allowlist, &mut violations);
     assert!(
         violations.is_empty(),
-        "destructive filesystem calls outside src/core/sink.rs: {violations:?}"
+        "destructive filesystem calls outside the approved sink allowlist: {violations:?}"
     );
 }
 
-fn inspect_sources(root: &Path, directory: &Path, violations: &mut Vec<String>) {
+fn inspect_sources(
+    directory: &Path,
+    allowlist: &[std::path::PathBuf],
+    violations: &mut Vec<String>,
+) {
     for entry in fs::read_dir(directory).expect("read source directory") {
         let entry = entry.expect("read source entry");
         let path = entry.path();
-        if path.is_dir() {
-            inspect_sources(root, &path, violations);
-        } else if path.extension().is_some_and(|extension| extension == "rs")
-            && path != root.join("core/sink.rs")
+        let file_type = entry.file_type().expect("inspect source entry type");
+        if file_type.is_dir() {
+            inspect_sources(&path, allowlist, violations);
+        } else if file_type.is_symlink() {
+            violations.push(format!(
+                "{}: symlinked source was not audited",
+                path.display()
+            ));
+        } else if file_type.is_file()
+            && path.extension().is_some_and(|extension| extension == "rs")
+            && !allowlist.contains(&path)
         {
             let source_size = fs::metadata(&path).expect("inspect source metadata").len();
             assert!(

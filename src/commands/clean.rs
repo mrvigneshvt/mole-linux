@@ -7,9 +7,8 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use rustix::fs::statvfs;
-
 use crate::adapters::run_owner_action;
+use crate::core::fsutil::available_bytes;
 use crate::core::oplog::{OpLog, Session, SessionSummary};
 use crate::core::outcome::Outcome;
 use crate::core::paths::XdgPaths;
@@ -673,11 +672,6 @@ fn session_summary(summary: &CleanSummary) -> SessionSummary {
             .allocated_applied
             .map_or_else(|| "unknown".to_owned(), |size| format!("{size}B")),
     }
-}
-
-fn available_bytes(path: &Path) -> io::Result<u128> {
-    let stats = statvfs(path).map_err(io::Error::from)?;
-    Ok(u128::from(stats.f_bavail) * u128::from(stats.f_frsize))
 }
 
 fn render_summary(

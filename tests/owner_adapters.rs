@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use mole_linux::adapters::{
@@ -108,8 +109,17 @@ fn action(program: &Path, adapter: &dyn OwnerAdapter) -> OwnerAction {
 
 // --- npm -------------------------------------------------------------------
 
+/// Shim tests in one binary run one at a time. A sibling test's fork can hold a freshly written
+/// shim open for write, and exec then fails with ETXTBSY ("Text file busy").
+static SHIM_SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SHIM_SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[test]
 fn npm_resolves_the_cache_the_owner_reports_without_running_clean() {
+    let _serial = serial();
     let s = sandbox();
     let cache = s.home.join(".npm");
     write_shim(
@@ -134,6 +144,7 @@ fn npm_resolves_the_cache_the_owner_reports_without_running_clean() {
 
 #[test]
 fn npm_missing_is_unavailable_not_zero() {
+    let _serial = serial();
     let s = sandbox();
     fs::create_dir_all(&s.bin).expect("empty PATH dir");
     let refusal = resolve(&Npm, &s.env(&s.bin)).expect_err("missing npm");
@@ -142,6 +153,7 @@ fn npm_missing_is_unavailable_not_zero() {
 
 #[test]
 fn relative_path_entries_are_never_resolved() {
+    let _serial = serial();
     let s = sandbox();
     // A relative PATH entry would let a repository's ./npm run as the user.
     write_shim(&s.bin, "npm", "npm", &s.log, "echo 10.9.0");
@@ -157,6 +169,7 @@ fn relative_path_entries_are_never_resolved() {
 
 #[test]
 fn running_npm_is_refused_before_any_owner_query() {
+    let _serial = serial();
     let s = sandbox();
     write_shim(&s.bin, "npm", "npm", &s.log, "echo 10.9.0");
     fake_process(&s.proc_root, 4242, &["npm", "install", "left-pad"]);
@@ -170,6 +183,7 @@ fn running_npm_is_refused_before_any_owner_query() {
 
 #[test]
 fn unknown_process_state_is_unavailable_not_safe() {
+    let _serial = serial();
     let s = sandbox();
     write_shim(&s.bin, "npm", "npm", &s.log, "echo 10.9.0");
     let mut env = s.env(&s.bin);
@@ -181,6 +195,7 @@ fn unknown_process_state_is_unavailable_not_safe() {
 
 #[test]
 fn non_absolute_npm_cache_path_is_refused() {
+    let _serial = serial();
     let s = sandbox();
     write_shim(
         &s.bin,
@@ -195,6 +210,7 @@ fn non_absolute_npm_cache_path_is_refused() {
 
 #[test]
 fn npm_clean_action_runs_owner_cache_clean_force() {
+    let _serial = serial();
     let s = sandbox();
     let program = write_shim(&s.bin, "npm", "npm", &s.log, "exit 0");
     let (outcome, reason) = run_owner_action(&action(&program, &Npm));
@@ -207,6 +223,7 @@ fn npm_clean_action_runs_owner_cache_clean_force() {
 
 #[test]
 fn failing_owner_clean_is_failed() {
+    let _serial = serial();
     let s = sandbox();
     let program = write_shim(&s.bin, "npm", "npm", &s.log, "exit 3");
     let (outcome, reason) = run_owner_action(&action(&program, &Npm));
@@ -215,6 +232,7 @@ fn failing_owner_clean_is_failed() {
 
 #[test]
 fn hung_owner_command_is_killed_and_reported_unavailable() {
+    let _serial = serial();
     let s = sandbox();
     let program = write_shim(&s.bin, "npm", "npm", &s.log, "sleep 30");
     let short = OwnerAction {
@@ -236,6 +254,7 @@ fn hung_owner_command_is_killed_and_reported_unavailable() {
 
 #[test]
 fn pnpm_resolves_each_distinct_store_from_path_and_mise_installs() {
+    let _serial = serial();
     let s = sandbox();
     let v11 = s.home.join("Library/pnpm/store/v11");
     let v10 = s.home.join(".local/share/pnpm/store/v10");
@@ -270,6 +289,7 @@ fn pnpm_resolves_each_distinct_store_from_path_and_mise_installs() {
 
 #[test]
 fn pnpm_store_path_with_parent_traversal_is_refused() {
+    let _serial = serial();
     let s = sandbox();
     write_shim(
         &s.bin,
@@ -284,6 +304,7 @@ fn pnpm_store_path_with_parent_traversal_is_refused() {
 
 #[test]
 fn pnpm_store_prune_action_runs_owner_prune() {
+    let _serial = serial();
     let s = sandbox();
     let program = write_shim(&s.bin, "pnpm", "pnpm", &s.log, "exit 0");
     let (outcome, reason) = run_owner_action(&action(&program, &Pnpm));
@@ -293,6 +314,7 @@ fn pnpm_store_prune_action_runs_owner_prune() {
 
 #[test]
 fn running_pnpm_started_by_node_is_refused() {
+    let _serial = serial();
     let s = sandbox();
     write_shim(&s.bin, "pnpm", "pnpm", &s.log, "echo 11.0.0");
     fake_process(
@@ -309,6 +331,7 @@ fn running_pnpm_started_by_node_is_refused() {
 
 #[test]
 fn bun_resolves_the_cache_bun_reports() {
+    let _serial = serial();
     let s = sandbox();
     let cache = s.home.join(".bun/install/cache");
     write_shim(
@@ -326,6 +349,7 @@ fn bun_resolves_the_cache_bun_reports() {
 
 #[test]
 fn bun_cache_query_failure_is_refused_with_the_owner_status() {
+    let _serial = serial();
     let s = sandbox();
     write_shim(
         &s.bin,
@@ -342,6 +366,7 @@ fn bun_cache_query_failure_is_refused_with_the_owner_status() {
 
 #[test]
 fn bun_relative_cache_path_is_refused() {
+    let _serial = serial();
     let s = sandbox();
     write_shim(
         &s.bin,
@@ -356,6 +381,7 @@ fn bun_relative_cache_path_is_refused() {
 
 #[test]
 fn bun_cache_rm_failure_is_failed_and_deletes_nothing_itself() {
+    let _serial = serial();
     let s = sandbox();
     let cache = s.home.join(".bun/install/cache");
     fs::create_dir_all(&cache).expect("cache dir");
@@ -373,6 +399,7 @@ fn bun_cache_rm_failure_is_failed_and_deletes_nothing_itself() {
 
 #[test]
 fn corepack_probe_suppresses_the_download_prompt() {
+    let _serial = serial();
     let s = sandbox();
     write_shim(
         &s.bin,
@@ -401,6 +428,7 @@ fn corepack_probe_suppresses_the_download_prompt() {
 
 #[test]
 fn corepack_missing_is_unavailable_and_never_deletes_its_cache() {
+    let _serial = serial();
     let s = sandbox();
     let cache = s.home.join(".cache/node/corepack");
     fs::create_dir_all(&cache).expect("corepack cache");
@@ -416,6 +444,7 @@ fn corepack_missing_is_unavailable_and_never_deletes_its_cache() {
 
 #[test]
 fn corepack_home_at_filesystem_root_is_refused() {
+    let _serial = serial();
     let s = sandbox();
     write_shim(&s.bin, "corepack", "corepack", &s.log, "echo 0.34.0");
     let mut env = s.env(&s.bin);
@@ -431,6 +460,7 @@ fn corepack_home_at_filesystem_root_is_refused() {
 
 #[test]
 fn corepack_clean_action_runs_owner_cache_clean() {
+    let _serial = serial();
     let s = sandbox();
     let program = write_shim(&s.bin, "corepack", "corepack", &s.log, "exit 0");
     let (outcome, _) = run_owner_action(&action(&program, &Corepack));
@@ -442,6 +472,7 @@ fn corepack_clean_action_runs_owner_cache_clean() {
 
 #[test]
 fn command_probe_matches_node_wrapped_script_in_argv1() {
+    let _serial = serial();
     let s = sandbox();
     fake_process(&s.proc_root, 10, &["node", "/x/npm-cli.js", "ci"]);
     assert_eq!(
@@ -452,6 +483,7 @@ fn command_probe_matches_node_wrapped_script_in_argv1() {
 
 #[test]
 fn command_probe_ignores_lockfile_and_argument_mentions() {
+    let _serial = serial();
     let s = sandbox();
     fake_process(&s.proc_root, 11, &["vim", "pnpm-lock.yaml"]);
     fake_process(
@@ -471,6 +503,7 @@ fn command_probe_ignores_lockfile_and_argument_mentions() {
 
 #[test]
 fn command_probe_unreadable_proc_is_unknown() {
+    let _serial = serial();
     let s = sandbox();
     assert_eq!(
         is_command_running(&s.bin.join("no-such-proc"), &["npm"]),

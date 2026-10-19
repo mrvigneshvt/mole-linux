@@ -18,6 +18,8 @@ const MAX_DESKTOP_BYTES: u64 = 64 * 1024;
 pub struct Entry {
     pub name: String,
     pub detail: String,
+    /// The file behind the entry (AppImage, desktop file). `None` for package-manager sources.
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,6 +157,7 @@ pub fn parse_pacman_list(output: &str) -> Result<Vec<Entry>, String> {
                 entries.push(Entry {
                     name: name.to_owned(),
                     detail: version.to_owned(),
+                    path: None,
                 });
             }
             _ => return Err(format!("unexpected pacman output line: {line:?}")),
@@ -179,6 +182,7 @@ pub fn parse_flatpak_list(output: &str) -> Result<Vec<Entry>, String> {
             entries.push(Entry {
                 name: id.to_owned(),
                 detail: version.to_owned(),
+                path: None,
             });
         } else if index != 0 {
             return Err(format!("unexpected flatpak output line: {line:?}"));
@@ -222,6 +226,7 @@ fn appimages(paths: &XdgPaths) -> Status {
                 entries.push(Entry {
                     name: stem(&path),
                     detail: path.display().to_string(),
+                    path: Some(path),
                 });
             }
         }
@@ -254,6 +259,7 @@ fn desktop_entries(paths: &XdgPaths) -> Status {
             entries.push(Entry {
                 name: stem(&path),
                 detail: format!("{detail} (not parsed: larger than 64 KiB)"),
+                path: Some(path),
             });
             continue;
         }
@@ -263,11 +269,16 @@ fn desktop_entries(paths: &XdgPaths) -> Status {
                 entries.push(Entry {
                     name: stem(&path),
                     detail: format!("{detail} (unreadable: {error})"),
+                    path: Some(path),
                 });
                 continue;
             }
         };
-        entries.push(Entry { name, detail });
+        entries.push(Entry {
+            name,
+            detail,
+            path: Some(path),
+        });
     }
     Status::Listed(entries)
 }
@@ -289,7 +300,7 @@ pub fn parse_desktop_name(contents: &str) -> Option<String> {
 }
 
 /// Lists a directory's paths. A missing directory is empty, not an error.
-fn list_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn list_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let reader = match fs::read_dir(dir) {
         Ok(reader) => reader,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -309,7 +320,7 @@ fn list_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
-fn read_capped(path: &Path) -> io::Result<String> {
+pub(crate) fn read_capped(path: &Path) -> io::Result<String> {
     let mut bytes = Vec::new();
     fs::File::open(path)?
         .take(MAX_DESKTOP_BYTES + 1)
@@ -353,7 +364,7 @@ pub fn render(inventory: &Inventory) -> String {
     out
 }
 
-fn escape_controls(value: &str) -> String {
+pub(crate) fn escape_controls(value: &str) -> String {
     value
         .chars()
         .map(|character| {

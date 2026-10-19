@@ -123,6 +123,9 @@ struct UninstallArgs {
     permanent: bool,
     #[arg(long)]
     whitelist: bool,
+    /// Installed app to preview leftovers for (with --dry-run).
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -208,6 +211,7 @@ fn run() -> io::Result<()> {
                 list: false,
                 permanent: false,
                 whitelist: false,
+                name: None,
             }),
             Some(tui::MenuChoice::Optimize) => Command::Optimize(OptimizeArgs {
                 dry_run: false,
@@ -274,6 +278,8 @@ fn run() -> io::Result<()> {
         Command::Uninstall(args) => {
             if args.list {
                 mole_linux::commands::uninstall::run_list()
+            } else if let (true, Some(name)) = (args.dry_run, args.name.as_deref()) {
+                mole_linux::commands::uninstall_leftovers::run_preview(name)
             } else {
                 not_implemented("uninstall", 36)
             }

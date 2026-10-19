@@ -376,10 +376,15 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 use rustix::fs::{statfs, statvfs};
 
+use crate::commands::analyze_delete::trash_confirmed;
+use crate::core::oplog::OpLog;
+use crate::core::paths::XdgPaths;
+use crate::core::sink::{Identity, SinkContext};
+use crate::core::whitelist::Whitelist;
 use crate::scan;
 use crate::scan::{EntryKind, Node, NodeStatus, ScanEvent, ScanReport};
 use crate::status;
@@ -791,6 +796,16 @@ impl LargeFilesView {
     fn is_filtering(&self) -> bool {
         self.filtering
     }
+
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.selected.iter().cloned().collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    fn clear_selected(&mut self) {
+        self.selected.clear();
+    }
     fn filter(&self) -> &str {
         &self.filter
     }
@@ -946,6 +961,8 @@ pub struct App {
     scan_failed: bool,
     large_files: LargeFilesView,
     show_large_files: bool,
+    pending_delete: Option<Vec<(PathBuf, Identity)>>,
+    delete_message: Option<String>,
 }
 
 impl App {
@@ -967,6 +984,8 @@ impl App {
             scan_failed: false,
             large_files: LargeFilesView::default(),
             show_large_files: false,
+            pending_delete: None,
+            delete_message: None,
         }
     }
 
@@ -1207,15 +1226,21 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             )
         } else {
             format!(
-                "↑/↓ move  / filter  Space select  r refresh  Esc back{}",
+                "↑/↓ move  / filter  Space select  d Trash  r refresh  Esc back{}{}",
                 if app.large_files.selected_count() > 0 {
                     format!("  {} selected", app.large_files.selected_count())
                 } else {
                     String::new()
-                }
+                },
+                app.delete_message
+                    .as_ref()
+                    .map_or_else(String::new, |message| format!("  {message}"))
             )
         };
         frame.render_widget(Paragraph::new(footer), chunks[2]);
+        if let Some(entries) = &app.pending_delete {
+            render_delete_confirmation(frame, entries);
+        }
         return;
     }
 
@@ -1280,6 +1305,49 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     );
 }
 
+fn render_delete_confirmation(frame: &mut Frame<'_>, entries: &[(PathBuf, Identity)]) {
+    let area = centered_rect(80, 70, frame.area());
+    let paths = entries
+        .iter()
+        .map(|(path, _)| escape_name(path.as_os_str()))
+        .collect::<Vec<_>>();
+    let mut lines = vec![Line::from("Trash these selected paths?")];
+    lines.extend(paths.into_iter().map(Line::from));
+    lines.push(Line::from("y confirm  n/Esc cancel"));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Confirm Trash"),
+        ),
+        area,
+    );
+}
+
+fn centered_rect(
+    width_percent: u16,
+    height_percent: u16,
+    area: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height_percent) / 2),
+            Constraint::Percentage(height_percent),
+            Constraint::Percentage((100 - height_percent) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width_percent) / 2),
+            Constraint::Percentage(width_percent),
+            Constraint::Percentage((100 - width_percent) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
 pub fn run(
     path: &Path,
     mut reports: Receiver<ScanEvent>,
@@ -1326,6 +1394,33 @@ pub fn run(
                 continue;
             }
             match key.code {
+                KeyCode::Char('y') if app.pending_delete.is_some() => {
+                    let Some(entries) = app.pending_delete.take() else {
+                        continue;
+                    };
+                    let paths = entries
+                        .iter()
+                        .map(|(path, _)| path.clone())
+                        .collect::<Vec<_>>();
+                    let xdg = XdgPaths::from_env().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "HOME is not set or invalid")
+                    })?;
+                    let whitelist = Whitelist::load(&xdg).map_err(|error| {
+                        io::Error::other(format!("failed to load whitelist: {error:?}"))
+                    })?;
+                    let context = SinkContext::new(xdg, whitelist);
+                    let oplog = OpLog::new()?;
+                    let results = trash_confirmed(entries, &paths, &context, &oplog)?;
+                    let applied = results.iter().filter(|(_, result)| result.is_ok()).count();
+                    let failed = results.len().saturating_sub(applied);
+                    app.large_files.clear_selected();
+                    app.delete_message =
+                        Some(format!("trashed {applied}; skipped/failed {failed}"));
+                }
+                KeyCode::Char('n') | KeyCode::Esc if app.pending_delete.is_some() => {
+                    app.pending_delete = None;
+                }
+                _ if app.pending_delete.is_some() => {}
                 KeyCode::Char('q') => break,
                 KeyCode::Esc
                     if app.show_large_files
@@ -1349,6 +1444,29 @@ pub fn run(
                 }
                 KeyCode::Char(' ') if app.show_large_files && !app.large_files.is_filtering() => {
                     app.large_files.toggle_selected()
+                }
+                KeyCode::Char('d') if app.show_large_files && !app.large_files.is_filtering() => {
+                    let mut entries = Vec::new();
+                    let mut capture_failed = false;
+                    for path in app.large_files.selected_paths() {
+                        match Identity::capture(&path) {
+                            Ok(identity) => entries.push((path, identity)),
+                            Err(_) => {
+                                capture_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if capture_failed {
+                        app.delete_message = Some(
+                            "a selected path is unavailable; refresh and select again".to_owned(),
+                        );
+                        continue;
+                    }
+                    if !entries.is_empty() {
+                        app.pending_delete = Some(entries);
+                        app.delete_message = None;
+                    }
                 }
                 KeyCode::Enter if app.show_large_files && app.large_files.is_filtering() => {
                     app.large_files.apply_filter()

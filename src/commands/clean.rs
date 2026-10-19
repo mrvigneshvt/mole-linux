@@ -237,6 +237,16 @@ pub fn execute_rules_with_owner(
 
     let mut apply = Vec::new();
     for (rule_id, mut candidate) in candidates {
+        if candidate.recovery == crate::rules::clean::RecoveryMode::OwnerNative {
+            summary.attention = summary.attention.saturating_add(1);
+            println!(
+                "Attention: {} · {}",
+                candidate.report.as_deref().unwrap_or("owner-native report"),
+                escape_text(&candidate.reason)
+            );
+            session.record("CLEAN", "attention", &candidate.path)?;
+            continue;
+        }
         if context.cancel.load(Ordering::Relaxed) {
             summary.cancelled = true;
             record(&mut summary, session, "skipped", &candidate.path)?;

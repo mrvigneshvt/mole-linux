@@ -55,6 +55,7 @@ fn dry_run_previews_xdg_user_essentials_without_changing_targets_or_reporting_sp
     assert!(stdout.contains("thumbnail"), "{stdout}");
     assert!(stdout.contains("app.log"), "{stdout}");
     assert!(stdout.contains("old.txt"), "{stdout}");
+    assert!(stdout.contains("Not selected [user]"), "{stdout}");
     assert!(
         !stdout.contains("Measured statvfs free-space delta"),
         "{stdout}"
@@ -70,7 +71,7 @@ fn dry_run_previews_xdg_user_essentials_without_changing_targets_or_reporting_sp
 }
 
 #[test]
-fn clean_apply_empties_only_trash_and_known_user_cache_targets() {
+fn selecting_user_essentials_preserves_trash_by_default() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let home = temp.path().join("home");
     fs::create_dir_all(home.join(".test-xdg/cache/thumbnails")).expect("thumbnail directory");
@@ -97,8 +98,107 @@ fn clean_apply_empties_only_trash_and_known_user_cache_targets() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!home.join(".test-xdg/cache/thumbnails/preview.png").exists());
-    assert!(!home.join(".test-xdg/data/Trash/files/old.txt").exists());
+    assert!(home.join(".test-xdg/data/Trash/files/old.txt").exists());
     assert!(home.join("Documents/keep.txt").exists());
+}
+
+#[test]
+fn trash_is_explicitly_selectable_and_help_explains_the_choice() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    fs::create_dir_all(home.join(".test-xdg/data/Trash/files")).expect("Trash files");
+    fs::create_dir_all(home.join(".test-xdg/data/Trash/info")).expect("Trash info");
+    fs::write(home.join(".test-xdg/data/Trash/files/old.txt"), b"trashed").expect("Trash item");
+
+    let applied = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
+        .args(["clean", "--yes", "--select", "trash"])
+        .isolated_home(&home)
+        .output()
+        .expect("explicitly empty Trash");
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert!(!home.join(".test-xdg/data/Trash/files/old.txt").exists());
+
+    fs::write(
+        home.join(".test-xdg/data/Trash/files/category.txt"),
+        b"trashed",
+    )
+    .expect("second Trash item");
+    let category = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
+        .args(["clean", "--yes", "--select", "user"])
+        .isolated_home(&home)
+        .output()
+        .expect("select user category");
+    assert!(
+        category.status.success(),
+        "{}",
+        String::from_utf8_lossy(&category.stderr)
+    );
+    assert!(
+        !home
+            .join(".test-xdg/data/Trash/files/category.txt")
+            .exists()
+    );
+
+    let help = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
+        .args(["clean", "--help"])
+        .output()
+        .expect("clean help");
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("trash"), "{help}");
+    assert!(help.contains("irreversible"), "{help}");
+}
+
+#[test]
+fn non_directory_state_entries_are_skipped_without_partial_discovery() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    let state = home.join(".test-xdg/state");
+    fs::create_dir_all(state.join("valid/log")).expect("valid log directory");
+    fs::write(state.join("valid/log/app.log"), b"old log").expect("valid log");
+    fs::write(state.join("not-an-app-directory"), b"state file").expect("state file");
+    fs::create_dir_all(state.join("app-with-file-log")).expect("app state directory");
+    fs::write(state.join("app-with-file-log/log"), b"not a log directory").expect("log path file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
+        .args(["clean", "--dry-run", "--yes", "--select", "user-essentials"])
+        .isolated_home(&home)
+        .output()
+        .expect("preview user state logs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("app.log"), "{stdout}");
+    assert!(!stdout.contains("partial discovery"), "{stdout}");
+}
+
+#[test]
+fn partial_discovery_names_control_escaped_offending_path() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("bad\nhome");
+    fs::create_dir_all(&home).expect("HOME");
+    fs::write(home.join("Downloads"), b"not a directory").expect("Downloads path file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
+        .args(["clean", "--dry-run", "--yes", "--select", "user-essentials"])
+        .isolated_home(&home)
+        .output()
+        .expect("preview malformed state root");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("partial discovery"), "{stdout}");
+    assert!(stdout.contains("bad\\\\x0ahome/Downloads"), "{stdout}");
+    assert!(!stdout.contains("bad\nhome/Downloads"), "{stdout}");
 }
 
 #[test]
@@ -180,7 +280,8 @@ fn coredumps_are_reported_as_attention_without_an_apply_action() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("coredumpctl list count: 2"), "{stdout}");
-    assert!(stdout.contains("readable size:"), "{stdout}");
+    assert!(stdout.contains("readable size (SI):"), "{stdout}");
+    assert!(!stdout.contains("readable size: "), "{stdout}");
     assert!(stdout.contains("retention is managed by systemd-tmpfiles (/usr/lib/tmpfiles.d/systemd.conf, default 3d) and coredump.conf MaxUse=; mole-linux does not delete system coredumps"), "{stdout}");
     assert!(stdout.contains("attention: 1"), "{stdout}");
     assert!(stdout.contains("applied: 0"), "{stdout}");

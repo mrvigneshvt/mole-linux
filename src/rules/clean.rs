@@ -184,6 +184,7 @@ pub fn candidate(
 pub fn catalog() -> Vec<Box<dyn CleanRule>> {
     let mut rules: Vec<Box<dyn CleanRule>> = vec![
         Box::new(UserEssentialsRule),
+        Box::new(TrashRule),
         Box::new(CoredumpReportRule),
         super::browser::registered(),
         super::project_cache::registered(),
@@ -192,6 +193,43 @@ pub fn catalog() -> Vec<Box<dyn CleanRule>> {
     rules.extend(super::owner_cache::registered());
     rules.push(super::journal::registered());
     rules
+}
+
+struct TrashRule;
+
+impl CleanRule for TrashRule {
+    fn id(&self) -> &str {
+        "trash"
+    }
+
+    fn category(&self) -> Category {
+        Category::User
+    }
+
+    fn discover(&self, ctx: &RuleContext<'_>) -> Discovery {
+        let mut candidates = Vec::new();
+        let mut partial = None;
+        let trash = ctx.xdg.data.join("Trash");
+        discover_children(
+            &trash.join("files"),
+            "explicitly empty user Trash",
+            RecoveryMode::Irreversible,
+            &mut candidates,
+            &mut partial,
+        );
+        discover_children(
+            &trash.join("info"),
+            "Trash metadata paired with user Trash items",
+            RecoveryMode::Irreversible,
+            &mut candidates,
+            &mut partial,
+        );
+        for value in &mut candidates {
+            value.selected_by_default = false;
+        }
+        let status = partial.map_or(DiscoveryStatus::Complete, DiscoveryStatus::Partial);
+        Discovery { candidates, status }
+    }
 }
 
 struct CoredumpReportRule;
@@ -262,8 +300,8 @@ impl CleanRule for CoredumpReportRule {
         value.apparent_size = size;
         value.allocated_size = None;
         value.report = Some(format!(
-            "coredumpctl list count: {count}; readable size: {}",
-            size.map_or_else(|| "Unknown".to_owned(), |bytes| format!("{bytes} bytes"))
+            "coredumpctl list count: {count}; readable size (SI): {}",
+            size.map_or_else(|| "Unknown".to_owned(), format_size_si)
         ));
         Discovery {
             candidates: vec![value],
@@ -394,28 +432,35 @@ impl CleanRule for UserEssentialsRule {
             &mut partial,
         );
 
-        let trash = ctx.xdg.data.join("Trash");
-        discover_children(
-            &trash.join("files"),
-            "explicitly empty user Trash",
-            RecoveryMode::Irreversible,
-            &mut candidates,
-            &mut partial,
-        );
-        discover_children(
-            &trash.join("info"),
-            "Trash metadata paired with user Trash items",
-            RecoveryMode::Irreversible,
-            &mut candidates,
-            &mut partial,
-        );
-
         match std::fs::read_dir(&ctx.xdg.state) {
             Ok(apps) => {
                 for app in apps {
                     match app {
                         Ok(app) => {
-                            let log_dir = app.path().join("log");
+                            let app_path = app.path();
+                            match std::fs::symlink_metadata(&app_path) {
+                                Ok(metadata) if metadata.is_dir() => {}
+                                Ok(_) => continue,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    continue;
+                                }
+                                Err(error) => {
+                                    partial = Some(format!("{}: {error}", escaped_path(&app_path)));
+                                    continue;
+                                }
+                            }
+                            let log_dir = app_path.join("log");
+                            match std::fs::symlink_metadata(&log_dir) {
+                                Ok(metadata) if !metadata.is_dir() => continue,
+                                Ok(_) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    continue;
+                                }
+                                Err(error) => {
+                                    partial = Some(format!("{}: {error}", escaped_path(&log_dir)));
+                                    continue;
+                                }
+                            }
                             discover_children(
                                 &log_dir,
                                 "application log under XDG state",
@@ -424,12 +469,14 @@ impl CleanRule for UserEssentialsRule {
                                 &mut partial,
                             );
                         }
-                        Err(error) => partial = Some(error.to_string()),
+                        Err(error) => {
+                            partial = Some(format!("{}: {error}", escaped_path(&ctx.xdg.state)))
+                        }
                     }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => partial = Some(error.to_string()),
+            Err(error) => partial = Some(format!("{}: {error}", escaped_path(&ctx.xdg.state))),
         }
 
         // Ported from tw93/Mole lib/clean/user.sh:_clean_incomplete_downloads (GPL-3.0).
@@ -441,7 +488,7 @@ impl CleanRule for UserEssentialsRule {
                     let entry = match entry {
                         Ok(entry) => entry,
                         Err(error) => {
-                            partial = Some(error.to_string());
+                            partial = Some(format!("{}: {error}", escaped_path(&downloads)));
                             continue;
                         }
                     };
@@ -459,14 +506,14 @@ impl CleanRule for UserEssentialsRule {
                         Ok(_) => continue,
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                         Err(error) => {
-                            partial = Some(error.to_string());
+                            partial = Some(format!("{}: {error}", escaped_path(&path)));
                             continue;
                         }
                     };
                     let modified = match metadata.modified() {
                         Ok(modified) => modified,
                         Err(error) => {
-                            partial = Some(error.to_string());
+                            partial = Some(format!("{}: {error}", escaped_path(&path)));
                             continue;
                         }
                     };
@@ -497,12 +544,12 @@ impl CleanRule for UserEssentialsRule {
                             candidates.push(value);
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => partial = Some(error.to_string()),
+                        Err(error) => partial = Some(format!("{}: {error}", escaped_path(&path))),
                     }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => partial = Some(error.to_string()),
+            Err(error) => partial = Some(format!("{}: {error}", escaped_path(&downloads))),
         }
 
         let status = partial.map_or(DiscoveryStatus::Complete, DiscoveryStatus::Partial);
@@ -525,14 +572,61 @@ fn discover_children(
                         match candidate(&entry.path(), reason, recovery, ProcessState::NotRunning) {
                             Ok(value) => candidates.push(value),
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(error) => *partial = Some(error.to_string()),
+                            Err(error) => {
+                                *partial = Some(format!("{}: {error}", escaped_path(&entry.path())))
+                            }
                         }
                     }
-                    Err(error) => *partial = Some(error.to_string()),
+                    Err(error) => *partial = Some(format!("{}: {error}", escaped_path(root))),
                 }
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => *partial = Some(error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {}
+        Err(error) => *partial = Some(format!("{}: {error}", escaped_path(root))),
+    }
+}
+
+fn escaped_path(path: &Path) -> String {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(|byte| {
+            if *byte < 0x20 || *byte == 0x7f {
+                format!("\\x{byte:02x}")
+            } else {
+                char::from(*byte).to_string()
+            }
+        })
+        .collect()
+}
+
+fn format_size_si(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["kB", "MB", "GB", "TB", "PB", "EB"];
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut divisor = 1000_u64;
+    for (index, unit) in UNITS.iter().enumerate() {
+        if index == UNITS.len() - 1 || bytes < divisor.saturating_mul(1000) {
+            let whole = bytes / divisor;
+            let tenths = (bytes % divisor) / (divisor / 10);
+            return format!("{whole}.{tenths} {unit}");
+        }
+        divisor = divisor.saturating_mul(1000);
+    }
+    format!("{bytes} B")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_size_si;
+
+    #[test]
+    fn coredump_sizes_use_si_units_across_u64_range() {
+        assert_eq!(format_size_si(999), "999 B");
+        assert_eq!(format_size_si(1_000), "1.0 kB");
+        assert_eq!(format_size_si(1_234_567), "1.2 MB");
+        assert_eq!(format_size_si(u64::MAX), "18.4 EB");
     }
 }

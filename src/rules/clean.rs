@@ -182,6 +182,22 @@ pub fn candidate(
     })
 }
 
+/// A candidate whose cleanup waits for the named process to be absent. A running or unknown
+/// owner keeps the candidate visible but unselected, and the final guard re-checks it.
+pub fn process_gated(
+    path: &Path,
+    reason: impl Into<String>,
+    recovery: RecoveryMode,
+    process: &str,
+    ctx: &RuleContext<'_>,
+) -> Result<Candidate, std::io::Error> {
+    let state = ctx.owner_state(process);
+    let mut item = candidate(path, reason, recovery, state)?;
+    item.owner_check = OwnerCheck::ProcessName(process.to_owned());
+    item.selected_by_default = state == ProcessState::NotRunning;
+    Ok(item)
+}
+
 /// Every registered Linux cleanup rule. Filters are validated against these ids and categories.
 pub fn catalog() -> Vec<Box<dyn CleanRule>> {
     let mut rules: Vec<Box<dyn CleanRule>> = vec![
@@ -193,6 +209,8 @@ pub fn catalog() -> Vec<Box<dyn CleanRule>> {
     ];
     rules.extend(super::system::catalog());
     rules.extend(super::owner_cache::registered());
+    rules.extend(super::editor_cache::registered());
+    rules.extend(super::automation::registered());
     rules.push(super::journal::registered());
     rules.extend(super::python::registered());
     rules

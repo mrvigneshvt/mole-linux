@@ -168,6 +168,26 @@ const CMDLINE_LIMIT: u64 = 64 * 1024;
 /// argv[1] catches node-wrapped owners (`node .../pnpm.cjs`) without matching a lockfile or an
 /// argument that merely mentions the name. Unreadable entries stay unknown unless a match is found.
 pub fn is_command_running(proc_root: &Path, names: &[&str]) -> ProcessState {
+    any_cmdline(proc_root, |cmdline| argv_names_command(cmdline, names))
+}
+
+/// Reports whether any process's argv contains `needle` as a byte substring, for profile paths that
+/// a browser passes as a flag. An empty needle is unknown, never a match. Unreadable entries stay
+/// unknown unless a match is found.
+pub fn is_argv_containing(proc_root: &Path, needle: &str) -> ProcessState {
+    if needle.is_empty() {
+        return ProcessState::Unknown;
+    }
+    any_cmdline(proc_root, |cmdline| {
+        cmdline
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    })
+}
+
+/// Walks every numeric proc entry's argv and reports Running on the first `matches` hit.
+/// A truncated argv that did not match leaves absence unproven, so the result is Unknown.
+fn any_cmdline(proc_root: &Path, matches: impl Fn(&[u8]) -> bool) -> ProcessState {
     let entries = match fs::read_dir(proc_root) {
         Ok(entries) => entries,
         Err(_) => return ProcessState::Unknown,
@@ -201,10 +221,10 @@ pub fn is_command_running(proc_root: &Path, names: &[&str]) -> ProcessState {
             unknown = true;
             continue;
         }
-        if argv_names_command(&cmdline, names) {
+        if matches(&cmdline) {
             return ProcessState::Running;
         }
-        // A truncated argv may hide argv[1]; absence is then unproven.
+        // A truncated argv may hide the match; absence is then unproven.
         if u64::try_from(cmdline.len()).is_ok_and(|len| len >= CMDLINE_LIMIT) {
             unknown = true;
         }

@@ -1,11 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use crate::core::proc::ProcessState;
-
 use super::clean::{
-    Candidate, Category, CleanRule, Discovery, DiscoveryStatus, OwnerCheck, RecoveryMode,
-    RuleContext, candidate,
+    Candidate, Category, CleanRule, Discovery, DiscoveryStatus, RecoveryMode, RuleContext,
+    process_gated,
 };
 
 const CHROMIUM_FAMILIES: &[(&str, &str, &str)] = &[
@@ -99,11 +97,7 @@ fn browser_candidate(
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Ok(None);
     }
-    let state = ctx.owner_state(process);
-    let mut item = candidate(path, reason, RecoveryMode::Regenerate, state)?;
-    item.owner_check = OwnerCheck::ProcessName(process.to_owned());
-    item.selected_by_default = state == ProcessState::NotRunning;
-    Ok(Some(item))
+    process_gated(path, reason, RecoveryMode::Regenerate, process, ctx).map(Some)
 }
 
 pub fn registered() -> Box<dyn CleanRule> {

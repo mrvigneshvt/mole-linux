@@ -5,6 +5,8 @@ pub mod browser;
 pub mod clean;
 pub mod editor_cache;
 pub mod flatpak;
+pub mod dev_caches;
+pub mod docker;
 pub mod journal;
 pub mod optimize;
 pub mod orphans;

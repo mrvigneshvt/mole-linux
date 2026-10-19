@@ -75,6 +75,8 @@ pub enum DiscoveryStatus {
     Complete,
     Partial(String),
     Unavailable(String),
+    /// Information for the user that offers nothing to clean (counted as attention).
+    Advisory(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +112,11 @@ pub trait CleanRule: Send + Sync {
     fn id(&self) -> &str;
     fn category(&self) -> Category;
     fn discover(&self, ctx: &RuleContext<'_>) -> Discovery;
+    /// Whether `--select <category>` counts as an explicit choice for this rule's candidates.
+    /// Rules that must run only when named by id return false.
+    fn selected_by_category(&self) -> bool {
+        true
+    }
     /// Re-checks a candidate just before the sink; `Err` keeps it and gives the reason.
     fn final_guard(&self, _candidate: &Candidate, _ctx: &RuleContext<'_>) -> Result<(), String> {
         Ok(())
@@ -210,6 +217,8 @@ pub fn catalog() -> Vec<Box<dyn CleanRule>> {
     rules.extend(super::system::catalog());
     rules.extend(super::owner_cache::registered());
     rules.extend(super::editor_cache::registered());
+    rules.extend(super::dev_caches::registered());
+    rules.extend(super::docker::registered());
     rules.push(super::journal::registered());
     rules.extend(super::python::registered());
     rules

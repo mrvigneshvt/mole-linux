@@ -57,6 +57,7 @@ pub enum OwnerProgram {
     UpdateDesktopDatabase,
     UpdateMimeDatabase,
     Systemctl,
+    Docker,
 }
 
 impl OwnerProgram {
@@ -71,6 +72,7 @@ impl OwnerProgram {
             Self::UpdateDesktopDatabase => "update-desktop-database",
             Self::UpdateMimeDatabase => "update-mime-database",
             Self::Systemctl => "systemctl",
+            Self::Docker => "docker",
         }
     }
 

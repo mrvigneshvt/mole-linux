@@ -222,6 +222,11 @@ pub fn execute_rules_with_owner(
                 record_outcome(&mut summary, "unavailable");
                 continue;
             }
+            DiscoveryStatus::Advisory(reason) => {
+                println!("{}: attention ({})", category.as_str(), escape_text(reason));
+                record_outcome(&mut summary, "attention");
+                continue;
+            }
         }
         for candidate in discovery.candidates {
             candidates.push((id.to_owned(), candidate));
@@ -293,7 +298,8 @@ pub fn execute_rules_with_owner(
             continue;
         }
         let explicitly_selected = selected.contains(&rule_id)
-            || selected.contains(category_for_rule(rules, &rule_id).as_str())
+            || (category_selects(rules, &rule_id)
+                && selected.contains(category_for_rule(rules, &rule_id).as_str()))
             || selected.contains(candidate.path.to_string_lossy().as_ref());
         // Owner actions run with sudo, so only an explicit --select runs them; sink items keep the default.
         let selected_for_action = explicitly_selected
@@ -636,6 +642,13 @@ fn category_for_rule(rules: &[&dyn CleanRule], id: &str) -> Category {
         .iter()
         .find(|rule| rule.id() == id)
         .map_or(Category::User, |rule| rule.category())
+}
+
+fn category_selects(rules: &[&dyn CleanRule], id: &str) -> bool {
+    rules
+        .iter()
+        .find(|rule| rule.id() == id)
+        .is_none_or(|rule| rule.selected_by_category())
 }
 
 fn parse_filter(value: Option<&str>) -> BTreeSet<String> {

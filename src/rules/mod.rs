@@ -3,6 +3,7 @@
 
 pub mod browser;
 pub mod clean;
+pub mod flatpak;
 pub mod journal;
 pub mod optimize;
 pub mod orphans;

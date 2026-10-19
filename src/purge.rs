@@ -370,7 +370,9 @@ fn has_authored_content_with_budget(path: &Path, budget: Duration) -> io::Result
     has_tracked_files(path, deadline)
 }
 
-fn has_tracked_files(path: &Path, deadline: Instant) -> io::Result<bool> {
+/// `Ok(true)` when Git tracks a file under `path`, `Ok(false)` when it does not or no repository
+/// encloses it, and `Err` when Git fails or cannot answer in time.
+pub fn has_tracked_files(path: &Path, deadline: Instant) -> io::Result<bool> {
     let mut repository = path.parent();
     while let Some(parent) = repository {
         let marker = parent.join(".git");
@@ -448,18 +450,20 @@ fn run_bounded_git_probe(mut command: Command, deadline: Instant) -> io::Result<
                 return Ok(true);
             }
             Ok(Ok(false)) => {
-                if let Some(status) = child.try_wait()? {
-                    reader
-                        .join()
-                        .map_err(|_| io::Error::other("git probe reader panicked"))?;
-                    return if status.success() {
-                        Ok(false)
-                    } else {
-                        Err(io::Error::other(
-                            "git could not verify tracked artifact content",
-                        ))
-                    };
-                }
+                // stdout closed without a byte: the listing is complete and only the
+                // exit status remains. Waiting here avoids reading the reader's
+                // disconnect as a failure when git has not been reaped yet.
+                let status = wait_for_exit(&mut child, deadline);
+                reader
+                    .join()
+                    .map_err(|_| io::Error::other("git probe reader panicked"))?;
+                return if status?.success() {
+                    Ok(false)
+                } else {
+                    Err(io::Error::other(
+                        "git could not verify tracked artifact content",
+                    ))
+                };
             }
             Ok(Err(error)) => {
                 if child.try_wait()?.is_none() {
@@ -476,6 +480,28 @@ fn run_bounded_git_probe(mut command: Command, deadline: Instant) -> io::Result<
                 return Err(io::Error::other("git probe reader disconnected"));
             }
         }
+    }
+}
+
+fn wait_for_exit(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+            }
+            let _ = child.wait()?;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "git content probe timed out",
+            ));
+        }
+        thread::sleep(Duration::from_millis(1));
     }
 }
 

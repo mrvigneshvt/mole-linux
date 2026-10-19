@@ -3,3 +3,4 @@
 
 pub mod browser;
 pub mod clean;
+pub mod project_cache;

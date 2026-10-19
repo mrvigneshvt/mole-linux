@@ -4,15 +4,20 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
+use std::process::{Child, Command as Process, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::core::outcome::Outcome;
 
 pub const SYSTEM_BIN_DIR: &str = "/usr/bin";
 pub const SUDO_PATH: &str = "/usr/bin/sudo";
+const QUERY_OUTPUT_LIMIT: u64 = 1024 * 1024;
+const QUERY_STDERR_LIMIT: u64 = 4096;
+const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrivilegeError {
@@ -72,6 +77,7 @@ pub struct OwnerCommand {
     program: OwnerProgram,
     args: Vec<OsString>,
     needs_root: bool,
+    no_match_exit: Option<i32>,
 }
 
 impl OwnerCommand {
@@ -84,7 +90,15 @@ impl OwnerCommand {
             program,
             args: args.into_iter().map(Into::into).collect(),
             needs_root,
+            no_match_exit: None,
         }
+    }
+
+    /// Declares the exit code the tool uses for "nothing matched" (e.g. `pacman -Qm` → 1).
+    /// Only a silent exit with this code counts as an empty answer in `OwnerRunner::query`.
+    pub fn no_match_on_exit(mut self, code: i32) -> Self {
+        self.no_match_exit = Some(code);
+        self
     }
 
     /// The exact argv that executes: `sudo -- <program> <args>` only when root is needed.
@@ -125,6 +139,7 @@ pub struct OwnerRunner {
     bin_dir: PathBuf,
     sudo: PathBuf,
     consent: Consent,
+    query_timeout: Duration,
 }
 
 impl OwnerRunner {
@@ -141,7 +156,13 @@ impl OwnerRunner {
             bin_dir,
             sudo,
             consent,
+            query_timeout: QUERY_TIMEOUT,
         }
+    }
+
+    pub fn with_query_timeout(mut self, timeout: Duration) -> Self {
+        self.query_timeout = timeout;
+        self
     }
 
     /// The exact argv `run` would execute for `cmd`, for consent prompts and dry-run output.
@@ -149,28 +170,91 @@ impl OwnerRunner {
         cmd.argv(&self.bin_dir, &self.sudo)
     }
 
-    /// Runs an unprivileged read-only query and returns its stdout. Queries never use sudo.
-    pub fn probe(&self, cmd: &OwnerCommand) -> Result<String, String> {
+    /// Read-only owner query: runs an unprivileged owner tool and returns its bounded stdout.
+    /// Never prompts and never uses sudo; a root-requiring query is refused, not escalated.
+    /// A silent exit with the command's declared no-match code is an empty answer; any
+    /// other failure is an error, so a locked database never reads as "nothing installed".
+    pub fn query(&self, cmd: &OwnerCommand) -> Result<String, OwnerRun> {
+        let argv = cmd.argv(&self.bin_dir, &self.sudo);
         if cmd.needs_root {
-            return Err("owner query never runs with sudo".to_owned());
+            return Err(skipped(argv, "owner query never runs with sudo; skipped"));
         }
         let program = cmd.program.path_in(&self.bin_dir);
         if !is_executable_file(&program) {
-            return Err(format!(
-                "{} is missing or not executable",
-                program.display()
+            return Err(unavailable(
+                argv,
+                format!("{} is missing or not executable", program.display()),
             ));
         }
-        // ponytail: stdout is read whole; paccache's dry-run summary is one line. Upgrade path: a capped reader that kills the child on overflow. Logged in KNOWN-GAPS.md.
-        let output = Process::new(&program)
+
+        let mut child = match Process::new(&program)
             .args(&cmd.args)
-            .output()
-            .map_err(|error| format!("could not start {}: {error}", program.display()))?;
-        if !output.status.success() {
-            return Err(format!("exited with {}", output.status));
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(unavailable(argv, format!("{error}")));
+            }
+            Err(error) => {
+                return Err(failed(argv, format!("could not start: {error}")));
+            }
+        };
+        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            let detail = stop(&mut child);
+            return Err(failed(argv, format!("output was unavailable; {detail}")));
+        };
+        // Reading stops at each limit; dropping a reader closes its pipe, so an oversized
+        // child gets EPIPE and exits instead of blocking forever.
+        let stdout_reader = read_capped(stdout, QUERY_OUTPUT_LIMIT);
+        let stderr_reader = read_capped(stderr, QUERY_STDERR_LIMIT);
+
+        let started = Instant::now();
+        let status: ExitStatus = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < self.query_timeout => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    // The readers are left to finish on their own: a grandchild may still hold a pipe.
+                    let detail = stop(&mut child);
+                    return Err(failed(argv, format!("timed out; {detail}")));
+                }
+                Err(error) => {
+                    let detail = stop(&mut child);
+                    return Err(failed(
+                        argv,
+                        format!("could not check status: {error}; {detail}"),
+                    ));
+                }
+            }
+        };
+        let stdout_bytes = match join_reader(stdout_reader) {
+            Ok(bytes) => bytes,
+            Err(reason) => return Err(failed(argv, reason)),
+        };
+        if u64::try_from(stdout_bytes.len()).map_or(true, |length| length > QUERY_OUTPUT_LIMIT) {
+            return Err(failed(argv, "output exceeded 1 MiB limit"));
         }
-        String::from_utf8(output.stdout)
-            .map_err(|_| format!("{} printed non-UTF-8 output", program.display()))
+        let stderr_bytes = match join_reader(stderr_reader) {
+            Ok(bytes) => bytes,
+            Err(reason) => return Err(failed(argv, reason)),
+        };
+        if status.success() {
+            return Ok(String::from_utf8_lossy(&stdout_bytes).into_owned());
+        }
+        if cmd.no_match_exit == status.code() && stdout_bytes.is_empty() && stderr_bytes.is_empty()
+        {
+            return Ok(String::new());
+        }
+        let message = String::from_utf8_lossy(&stderr_bytes);
+        match message.lines().map(str::trim).find(|line| !line.is_empty()) {
+            Some(line) => Err(failed(argv, format!("exited with {status}: {line}"))),
+            None => Err(failed(argv, format!("exited with {status}"))),
+        }
     }
 
     pub fn run(
@@ -273,6 +357,45 @@ fn is_executable_file(path: &Path) -> bool {
     fs::metadata(path)
         .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+/// Reads at most `limit` bytes plus one, so the caller can tell "over the limit" from "at it".
+fn read_capped<R: Read + Send + 'static>(
+    reader: R,
+    limit: u64,
+) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        reader
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    })
+}
+
+fn join_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, String> {
+    match handle.join() {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(error)) => Err(format!("could not read output: {error}")),
+        Err(_) => Err("output reader failed".to_owned()),
+    }
+}
+
+/// Kills and reaps a child that must not keep running; the text says what happened.
+fn stop(child: &mut Child) -> String {
+    match (child.kill(), child.wait()) {
+        (Ok(()), Ok(_)) => "terminated the tool".to_owned(),
+        (Err(kill_error), Ok(_)) => format!("could not terminate the tool: {kill_error}"),
+        (_, Err(wait_error)) => format!("could not reap the tool: {wait_error}"),
+    }
+}
+
+fn failed(argv: Vec<OsString>, reason: impl Into<String>) -> OwnerRun {
+    OwnerRun {
+        outcome: Outcome::Failed,
+        argv,
+        reason: Some(reason.into()),
+    }
 }
 
 fn skipped(argv: Vec<OsString>, reason: &str) -> OwnerRun {

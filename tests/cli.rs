@@ -25,14 +25,8 @@ fn unsupported_subcommands_parse_flags_and_exit_two() {
             31,
         ),
         (
-            &[
-                "uninstall",
-                "--dry-run",
-                "--list",
-                "--permanent",
-                "--whitelist",
-            ],
-            34,
+            &["uninstall", "--dry-run", "--permanent", "--whitelist"],
+            36,
         ),
         (&["optimize", "--dry-run", "--whitelist"], 39),
     ];

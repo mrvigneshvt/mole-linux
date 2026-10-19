@@ -44,6 +44,7 @@ impl CleanRule for TestRule {
                     selected_by_default: true,
                     owner_state: ctx.check_owner(&self.owner_check),
                     owner_check: self.owner_check.clone(),
+                    owner_action: None,
                 }
             })
             .collect();

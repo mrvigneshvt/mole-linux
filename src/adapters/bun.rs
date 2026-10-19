@@ -8,6 +8,10 @@ use crate::core::outcome::Outcome;
 pub struct Bun;
 
 impl OwnerAdapter for Bun {
+    fn rule_id(&self) -> &'static str {
+        "bun"
+    }
+
     fn label(&self) -> &'static str {
         "bun cache"
     }

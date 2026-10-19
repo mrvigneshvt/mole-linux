@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use rustix::fs::statvfs;
 
+use crate::adapters::run_owner_action;
 use crate::core::oplog::{OpLog, Session, SessionSummary};
 use crate::core::outcome::Outcome;
 use crate::core::paths::XdgPaths;
@@ -16,7 +17,7 @@ use crate::core::privilege::{
     Consent, OwnerCommand, OwnerRun, OwnerRunner, RunMode, ask_owner_consent,
 };
 use crate::core::proc::{self, ProcessState};
-use crate::core::sink::{DeleteMode, SinkContext, delete};
+use crate::core::sink::{DeleteMode, Identity, SinkContext, delete};
 use crate::core::validate::validate_path_for_deletion;
 use crate::core::whitelist::Whitelist;
 use crate::rules::clean::{
@@ -345,6 +346,31 @@ pub fn execute_rules_with_owner(
             }
             if let Some(reason) = final_guard_refusal(rules, &rule_id, &candidate, context) {
                 record(&mut summary, session, "skipped", &candidate.path)?;
+                println!(
+                    "{}: {}",
+                    display_path(&candidate.path),
+                    escape_text(&reason)
+                );
+                continue;
+            }
+            if let Some(action) = candidate.owner_action.clone() {
+                // The owner command acts on the directory that was previewed; refuse if it changed.
+                if Identity::capture(&candidate.path).ok().as_ref() != Some(&candidate.identity) {
+                    record(&mut summary, session, "skipped", &candidate.path)?;
+                    println!(
+                        "{}: changed since preview; owner command skipped",
+                        display_path(&candidate.path)
+                    );
+                    continue;
+                }
+                let (outcome, reason) = run_owner_action(&action);
+                let name = match outcome {
+                    Outcome::Applied => "applied",
+                    Outcome::Unavailable => "unavailable",
+                    _ => "failed",
+                };
+                record_outcome(&mut summary, name);
+                session.record("CLEAN", name, &candidate.path)?;
                 println!(
                     "{}: {}",
                     display_path(&candidate.path),

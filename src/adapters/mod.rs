@@ -1,12 +1,13 @@
-//! Owner-tool adapters for developer caches (M5.1). Each tool runs its own cache
-//! command by absolute path; this module never deletes files itself.
+//! Owner-tool adapters for developer caches (M5.1). Each tool reports its own
+//! cache directory and cleans it with its own command, run by absolute path.
+//! This module never deletes files itself; the clean runner owns selection,
+//! sizing, and accounting.
 
 mod bun;
 mod corepack;
 mod npm;
 mod pnpm;
 
-use std::collections::BTreeSet;
 use std::env::split_paths;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
@@ -17,9 +18,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::core::outcome::Outcome;
-use crate::core::privilege::{RunMode, is_executable_file};
+use crate::core::privilege::is_executable_file;
 use crate::core::proc::{self, ProcessState};
-use crate::core::whitelist::Whitelist;
+use crate::rules::clean::OwnerAction;
 
 pub use bun::Bun;
 pub use corepack::Corepack;
@@ -28,44 +29,44 @@ pub use pnpm::Pnpm;
 
 /// Owner tools that show a download prompt would hang a section until its timeout.
 const NO_DOWNLOAD_PROMPT: (&str, &str) = ("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
-/// Owner stdout is read up to this many bytes; a larger reply is treated as a failure.
+/// Owner stdout is read up to this many bytes; a larger reply times out.
 const OUTPUT_LIMIT: u64 = 64 * 1024;
 const POLL: Duration = Duration::from_millis(10);
-/// Probes and queries. Upstream QUICK_DETECT is 2s, but `pnpm --version` takes ~3.1s on the reference
-/// host (measured), so this uses upstream's PKG_LIST budget (10s). PKG_CLEANUP (20s) bounds cleanup.
+/// Probes and queries. Upstream QUICK_DETECT is 2s, but `pnpm --version` takes ~3.1s on the
+/// reference host (measured), so this uses upstream's PKG_LIST budget (10s).
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upstream PKG_CLEANUP budget for an owner cleanup command.
 pub const CLEAN_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Everything an adapter may read. Tests build it from temp directories; no ambient state.
+/// Everything an adapter may read. Callers build it; tests use temp directories.
 #[derive(Clone, Debug)]
 pub struct AdapterEnv {
     pub home: PathBuf,
     pub path: OsString,
     pub proc_root: PathBuf,
-    pub whitelist: Whitelist,
     pub query_timeout: Duration,
     pub clean_timeout: Duration,
     pub corepack_home: Option<OsString>,
 }
 
+/// A usable binary and the cache directory its owner reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Report {
-    pub label: &'static str,
-    pub outcome: Outcome,
-    pub program: Option<PathBuf>,
-    pub target: Option<PathBuf>,
-    pub reason: String,
+pub struct Resolved {
+    pub binary: PathBuf,
+    pub target: PathBuf,
 }
 
-/// Why an adapter cannot name a target. The outcome says whether the tool is absent or the path is refused.
+/// Why an adapter cannot use a binary or name a target. `outcome` says whether the tool is absent or the path refused.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Refusal {
     pub outcome: Outcome,
     pub reason: String,
 }
 
-pub trait OwnerAdapter: Sync {
-    /// Section label shown to the user, as in upstream output.
+pub trait OwnerAdapter: Send + Sync {
+    /// Clean-rule id used by `--select`, as upstream names the section.
+    fn rule_id(&self) -> &'static str;
+    /// Section label shown to the user.
     fn label(&self) -> &'static str;
     /// Owner program basename, resolved only through absolute PATH entries.
     fn program(&self) -> &'static str;
@@ -77,119 +78,92 @@ pub trait OwnerAdapter: Sync {
             .into_iter()
             .collect())
     }
-    /// The directory the owner will clean, as the owner itself reports it.
+    /// The cache directory the owner reports for this binary.
     fn target(&self, binary: &Path, env: &AdapterEnv) -> Result<PathBuf, Refusal>;
     /// Owner command arguments that perform the cleanup.
     fn clean_args(&self) -> &'static [&'static str];
+    /// Extra fact shown with the candidate, when the owner's command does less than its size suggests.
+    fn caveat(&self) -> Option<&'static str> {
+        None
+    }
 }
 
-/// Runs one adapter. Dry run only queries and reports; apply runs the owner command once per distinct target.
-pub fn run_adapter(adapter: &dyn OwnerAdapter, env: &AdapterEnv, mode: RunMode) -> Vec<Report> {
-    let label = adapter.label();
-    let binaries = match adapter.binaries(env) {
-        Ok(binaries) => binaries,
-        Err(reason) => return vec![report(label, Outcome::Unavailable, None, None, reason)],
-    };
+/// Resolves every usable binary for one adapter. The outer error means nothing can be used
+/// (absent, busy, or unknown state); each inner result is one binary's target or refusal.
+pub fn resolve(
+    adapter: &dyn OwnerAdapter,
+    env: &AdapterEnv,
+) -> Result<Vec<Result<Resolved, Refusal>>, Refusal> {
+    let binaries = adapter.binaries(env).map_err(|reason| Refusal {
+        outcome: Outcome::Unavailable,
+        reason,
+    })?;
     if binaries.is_empty() {
-        let reason = format!(
-            "{} is not installed on an absolute PATH entry",
-            adapter.program()
-        );
-        return vec![report(label, Outcome::Unavailable, None, None, reason)];
+        return Err(Refusal {
+            outcome: Outcome::Unavailable,
+            reason: format!(
+                "{} is not installed on an absolute PATH entry",
+                adapter.program()
+            ),
+        });
     }
     match proc::is_command_running(&env.proc_root, adapter.busy_names()) {
         ProcessState::NotRunning => {}
         ProcessState::Running => {
-            let reason = format!("{} is running", adapter.program());
-            return vec![report(label, Outcome::Skipped, None, None, reason)];
+            return Err(Refusal {
+                outcome: Outcome::Skipped,
+                reason: format!("{} is running", adapter.program()),
+            });
         }
         ProcessState::Unknown => {
-            let reason = "owner process state is unknown".to_owned();
-            return vec![report(label, Outcome::Unavailable, None, None, reason)];
+            return Err(Refusal {
+                outcome: Outcome::Unavailable,
+                reason: "owner process state is unknown".to_owned(),
+            });
         }
     }
-
-    let command = format!("{} {}", adapter.program(), adapter.clean_args().join(" "));
-    let mut reports = Vec::new();
-    let mut scheduled = BTreeSet::new();
-    for binary in binaries {
-        if let Err(error) = run_bounded(&binary, &["--version"], env.query_timeout) {
-            let reason = format!("--version failed: {}", error.describe());
-            reports.push(report(
-                label,
-                Outcome::Unavailable,
-                Some(binary),
-                None,
-                reason,
-            ));
-            continue;
-        }
-        let target = match adapter.target(&binary, env) {
-            Ok(target) => target,
-            Err(refusal) => {
-                reports.push(report(
-                    label,
-                    refusal.outcome,
-                    Some(binary),
-                    None,
-                    refusal.reason,
-                ));
-                continue;
-            }
-        };
-        if env.whitelist.is_whitelisted(&target) {
-            let reason = "whitelisted".to_owned();
-            reports.push(report(
-                label,
-                Outcome::Skipped,
-                Some(binary),
-                Some(target),
-                reason,
-            ));
-            continue;
-        }
-        // Two binaries that resolve to one store run one owner cleanup, as upstream dedupes.
-        if !scheduled.insert(target.clone()) {
-            continue;
-        }
-        let (outcome, reason) = match mode {
-            RunMode::DryRun => (Outcome::Unchanged, format!("would run `{command}`")),
-            RunMode::Apply => match run_bounded(&binary, adapter.clean_args(), env.clean_timeout) {
-                Ok(captured) if captured.status.success() => {
-                    (Outcome::Applied, format!("ran `{command}`"))
-                }
-                Ok(captured) => (
-                    Outcome::Failed,
-                    format!("`{command}` failed ({})", captured.status),
-                ),
-                Err(RunError::Timeout) => (
-                    Outcome::Unavailable,
-                    format!("`{command}` timed out and was killed"),
-                ),
-                Err(error) => (
-                    Outcome::Failed,
-                    format!("`{command}`: {}", error.describe()),
-                ),
-            },
-        };
-        reports.push(report(label, outcome, Some(binary), Some(target), reason));
-    }
-    reports
+    Ok(binaries
+        .into_iter()
+        .map(|binary| resolve_one(adapter, env, binary))
+        .collect())
 }
 
-fn report(
-    label: &'static str,
-    outcome: Outcome,
-    program: Option<PathBuf>,
-    target: Option<PathBuf>,
-    reason: String,
-) -> Report {
-    Report {
-        label,
-        outcome,
-        program,
-        target,
-        reason,
+fn resolve_one(
+    adapter: &dyn OwnerAdapter,
+    env: &AdapterEnv,
+    binary: PathBuf,
+) -> Result<Resolved, Refusal> {
+    if let Err(error) = run_bounded(&binary, &["--version"], env.query_timeout) {
+        return Err(Refusal {
+            outcome: Outcome::Unavailable,
+            reason: format!("--version failed: {}", error.describe()),
+        });
+    }
+    let target = adapter.target(&binary, env)?;
+    Ok(Resolved { binary, target })
+}
+
+/// Runs one owner cleanup command. Returns the outcome and a short reason.
+pub fn run_owner_action(action: &OwnerAction) -> (Outcome, String) {
+    let program = action.program.file_name().map_or_else(
+        || "owner".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let command = format!("{program} {}", action.args.join(" "));
+    match run_bounded(&action.program, action.args, action.timeout) {
+        Ok(captured) if captured.status.success() => (Outcome::Applied, format!("ran `{command}`")),
+        Ok(captured) => (
+            Outcome::Failed,
+            format!("`{command}` failed ({})", captured.status),
+        ),
+        Err(RunError::Timeout) => (
+            Outcome::Unavailable,
+            format!("`{command}` timed out and was killed"),
+        ),
+        Err(error) => (
+            Outcome::Failed,
+            format!("`{command}`: {}", error.describe()),
+        ),
     }
 }
 
@@ -217,7 +191,7 @@ fn query_text(binary: &Path, args: &[&str], env: &AdapterEnv) -> Result<String, 
     Ok(captured.stdout.trim_end_matches(['\n', '\r']).to_owned())
 }
 
-/// Accepts an absolute path with no control bytes and at least one component. Returns None otherwise.
+/// Accepts an absolute path with no control characters and at least one component.
 fn validated_absolute(text: &str) -> Option<PathBuf> {
     let path = PathBuf::from(text);
     let clean = !text.is_empty() && !text.chars().any(char::is_control);
@@ -239,19 +213,13 @@ impl RunError {
     }
 }
 
-/// Kills and reaps a child we are abandoning. kill fails only when the child exited first; wait reaps either way.
-fn reap(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 struct Captured {
     status: ExitStatus,
     stdout: String,
 }
 
-/// Runs an owner command by absolute path with argv as data, no shell, no inherited stdin.
-/// A child that outlives its timeout is killed; the caller decides what that means.
+/// Runs an owner command by absolute path with argv as data: no shell, no inherited stdin.
+/// A child that outlives `timeout` is killed and reported as `RunError::Timeout`.
 fn run_bounded(program: &Path, args: &[&str], timeout: Duration) -> Result<Captured, RunError> {
     let mut child = Command::new(program)
         .args(args)
@@ -297,4 +265,10 @@ fn run_bounded(program: &Path, args: &[&str], timeout: Duration) -> Result<Captu
         Err(_) => return Err(RunError::Io("output stream did not close".to_owned())),
     };
     Ok(Captured { status, stdout })
+}
+
+/// Kills and reaps a child we are abandoning. kill fails only when the child exited first; wait reaps either way.
+fn reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }

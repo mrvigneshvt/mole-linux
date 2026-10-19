@@ -8,6 +8,10 @@ use crate::core::outcome::Outcome;
 pub struct Npm;
 
 impl OwnerAdapter for Npm {
+    fn rule_id(&self) -> &'static str {
+        "npm"
+    }
+
     fn label(&self) -> &'static str {
         "npm cache"
     }

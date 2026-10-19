@@ -277,7 +277,12 @@ fn analyze_json_emits_a_document_instead_of_the_unimplemented_error() {
 
 #[test]
 fn global_debug_is_accepted_before_and_after_subcommand() {
-    for args in [&["--debug", "clean"][..], &["clean", "--debug"][..]] {
+    // --dry-run: real owner tools on PATH can create a cache (npm writes logs under HOME) that
+    // apply would select, and apply without a terminal correctly needs --yes.
+    for args in [
+        &["--debug", "clean", "--dry-run"][..],
+        &["clean", "--debug", "--dry-run"][..],
+    ] {
         let home = tempdir().expect("temporary HOME");
         let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
             .args(args)
@@ -285,7 +290,7 @@ fn global_debug_is_accepted_before_and_after_subcommand() {
             .output()
             .expect("run clean");
         assert_eq!(output.status.code(), Some(0), "args: {args:?}");
-        assert!(String::from_utf8_lossy(&output.stdout).contains("Clean complete"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Clean preview complete"));
     }
 }
 

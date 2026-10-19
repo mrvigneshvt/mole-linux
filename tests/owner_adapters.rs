@@ -1,6 +1,6 @@
 // Ported contracts: tw93/Mole tests/clean_dev_caches.bats (JS cases) and
-// tests/clean_corepack.bats (GPL-3.0). Owner tools are PATH-free shims that
-// record their argv; no test touches the real HOME or a real package manager.
+// tests/clean_corepack.bats (GPL-3.0). Owner tools are shims that record their
+// argv; no test touches the real HOME or a real package manager.
 
 use std::ffi::OsString;
 use std::fs;
@@ -8,17 +8,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use mole_linux::adapters::{AdapterEnv, Bun, Corepack, Npm, Pnpm, Report, run_adapter};
+use mole_linux::adapters::{
+    AdapterEnv, Bun, Corepack, Npm, OwnerAdapter, Pnpm, Refusal, Resolved, resolve,
+    run_owner_action,
+};
 use mole_linux::core::outcome::Outcome;
-use mole_linux::core::paths::XdgPaths;
-use mole_linux::core::privilege::RunMode;
 use mole_linux::core::proc::{ProcessState, is_command_running};
-use mole_linux::core::whitelist::Whitelist;
+use mole_linux::rules::clean::OwnerAction;
 
 const QUERY: Duration = Duration::from_secs(5);
 const CLEAN: Duration = Duration::from_secs(20);
 
-/// Writes an executable `sh` shim named `file_name` that appends `label` and its argv to `log`, then runs `body`.
+/// Writes an executable `sh` shim that appends `label` and its argv to `log`, then runs `body`.
 fn write_shim(dir: &Path, file_name: &str, label: &str, log: &Path, body: &str) -> PathBuf {
     fs::create_dir_all(dir).expect("shim dir");
     let script = format!(
@@ -57,7 +58,6 @@ struct Sandbox {
     bin: PathBuf,
     proc_root: PathBuf,
     log: PathBuf,
-    whitelist: Whitelist,
 }
 
 fn sandbox() -> Sandbox {
@@ -65,8 +65,6 @@ fn sandbox() -> Sandbox {
     let root = temp.path().to_path_buf();
     let home = root.join("home");
     fs::create_dir_all(&home).expect("home");
-    let xdg = XdgPaths::from_values(home.clone(), None, None, None, None).expect("xdg");
-    let whitelist = Whitelist::load(&xdg).expect("empty whitelist");
     let proc_root = root.join("proc");
     fs::create_dir_all(&proc_root).expect("proc root");
     Sandbox {
@@ -75,7 +73,6 @@ fn sandbox() -> Sandbox {
         _temp: temp,
         home,
         proc_root,
-        whitelist,
     }
 }
 
@@ -85,23 +82,32 @@ impl Sandbox {
             home: self.home.clone(),
             path: OsString::from(path),
             proc_root: self.proc_root.clone(),
-            whitelist: self.whitelist.clone(),
             query_timeout: QUERY,
             clean_timeout: CLEAN,
             corepack_home: None,
         }
     }
+
+    /// Resolves the only binary the adapter sees; panics with the full result otherwise.
+    fn first(&self, adapter: &dyn OwnerAdapter) -> Result<Resolved, Refusal> {
+        let results = resolve(adapter, &self.env(&self.bin)).expect("resolve");
+        assert_eq!(results.len(), 1, "expected one binary: {results:?}");
+        results.into_iter().next().expect("one result")
+    }
 }
 
-fn only(reports: &[Report]) -> &Report {
-    assert_eq!(reports.len(), 1, "expected one report: {reports:?}");
-    &reports[0]
+fn action(program: &Path, adapter: &dyn OwnerAdapter) -> OwnerAction {
+    OwnerAction {
+        program: program.to_path_buf(),
+        args: adapter.clean_args(),
+        timeout: CLEAN,
+    }
 }
 
 // --- npm -------------------------------------------------------------------
 
 #[test]
-fn npm_dry_run_previews_owner_cache_without_cleaning() {
+fn npm_resolves_the_cache_the_owner_reports_without_running_clean() {
     let s = sandbox();
     let cache = s.home.join(".npm");
     write_shim(
@@ -114,62 +120,33 @@ fn npm_dry_run_previews_owner_cache_without_cleaning() {
             cache.display()
         ),
     );
-    let reports = run_adapter(&Npm, &s.env(&s.bin), RunMode::DryRun);
-    let report = only(&reports);
-    assert_eq!(report.outcome, Outcome::Unchanged, "{report:?}");
-    assert_eq!(report.target.as_deref(), Some(cache.as_path()));
-    assert!(
-        report.reason.contains("npm cache clean --force"),
-        "{report:?}"
-    );
+    let resolved = s.first(&Npm).expect("npm resolves");
+    assert_eq!(resolved.target, cache);
+    assert_eq!(resolved.binary, s.bin.join("npm"));
     let calls = read_log(&s.log);
     assert!(
-        calls.iter().all(|call| !call.contains("cache\tclean")),
-        "dry run must not clean: {calls:?}"
-    );
-}
-
-#[test]
-fn npm_apply_runs_owner_cache_clean_force() {
-    let s = sandbox();
-    write_shim(
-        &s.bin,
-        "npm",
-        "npm",
-        &s.log,
-        &format!(
-            "case \"$*\" in '--version') echo 10.9.0;; 'config get cache') echo '{}/.npm';; esac",
-            s.home.display()
-        ),
-    );
-    let reports = run_adapter(&Npm, &s.env(&s.bin), RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Applied, "{reports:?}");
-    let calls = read_log(&s.log);
-    assert!(
-        calls.contains(&"npm\tcache\tclean\t--force".to_owned()),
-        "argv: {calls:?}"
+        calls.iter().all(|call| !call.contains("clean")),
+        "{calls:?}"
     );
 }
 
 #[test]
 fn npm_missing_is_unavailable_not_zero() {
     let s = sandbox();
-    let empty_bin = s.bin.clone();
-    fs::create_dir_all(&empty_bin).expect("empty PATH dir");
-    let reports = run_adapter(&Npm, &s.env(&empty_bin), RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Unavailable, "{reports:?}");
+    fs::create_dir_all(&s.bin).expect("empty PATH dir");
+    let refusal = resolve(&Npm, &s.env(&s.bin)).expect_err("missing npm");
+    assert_eq!(refusal.outcome, Outcome::Unavailable, "{refusal:?}");
 }
 
 #[test]
 fn relative_path_entries_are_never_resolved() {
     let s = sandbox();
     // A relative PATH entry would let a repository's ./npm run as the user.
-    // The shim exists only in an absolute directory that is not on PATH.
     write_shim(&s.bin, "npm", "npm", &s.log, "echo 10.9.0");
     let mut env = s.env(&s.bin);
     env.path = OsString::from("relative-bin");
-    let reports = run_adapter(&Npm, &env, RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Unavailable, "{reports:?}");
+    let refusal = resolve(&Npm, &env).expect_err("relative PATH");
+    assert_eq!(refusal.outcome, Outcome::Unavailable, "{refusal:?}");
     assert!(
         read_log(&s.log).is_empty(),
         "relative PATH must never execute"
@@ -177,13 +154,16 @@ fn relative_path_entries_are_never_resolved() {
 }
 
 #[test]
-fn running_npm_is_skipped_and_never_queried() {
+fn running_npm_is_refused_before_any_owner_query() {
     let s = sandbox();
     write_shim(&s.bin, "npm", "npm", &s.log, "echo 10.9.0");
     fake_process(&s.proc_root, 4242, &["npm", "install", "left-pad"]);
-    let reports = run_adapter(&Npm, &s.env(&s.bin), RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Skipped, "{reports:?}");
-    assert!(read_log(&s.log).is_empty(), "busy owner must not run");
+    let refusal = resolve(&Npm, &s.env(&s.bin)).expect_err("busy npm");
+    assert_eq!(refusal.outcome, Outcome::Skipped, "{refusal:?}");
+    assert!(
+        read_log(&s.log).is_empty(),
+        "busy owner must not be queried"
+    );
 }
 
 #[test]
@@ -192,13 +172,13 @@ fn unknown_process_state_is_unavailable_not_safe() {
     write_shim(&s.bin, "npm", "npm", &s.log, "echo 10.9.0");
     let mut env = s.env(&s.bin);
     env.proc_root = s.bin.join("no-such-proc");
-    let reports = run_adapter(&Npm, &env, RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Unavailable, "{reports:?}");
+    let refusal = resolve(&Npm, &env).expect_err("unknown state");
+    assert_eq!(refusal.outcome, Outcome::Unavailable, "{refusal:?}");
     assert!(read_log(&s.log).is_empty());
 }
 
 #[test]
-fn non_absolute_npm_cache_path_is_unavailable_and_not_cleaned() {
+fn non_absolute_npm_cache_path_is_refused() {
     let s = sandbox();
     write_shim(
         &s.bin,
@@ -207,90 +187,53 @@ fn non_absolute_npm_cache_path_is_unavailable_and_not_cleaned() {
         &s.log,
         "case \"$*\" in '--version') echo 10.9.0;; 'config get cache') echo 'relative/cache';; esac",
     );
-    let reports = run_adapter(&Npm, &s.env(&s.bin), RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Unavailable, "{reports:?}");
-    let calls = read_log(&s.log);
-    assert!(
-        calls.iter().all(|call| !call.contains("cache\tclean")),
-        "{calls:?}"
+    let refusal = s.first(&Npm).expect_err("relative cache path");
+    assert_eq!(refusal.outcome, Outcome::Unavailable, "{refusal:?}");
+}
+
+#[test]
+fn npm_clean_action_runs_owner_cache_clean_force() {
+    let s = sandbox();
+    let program = write_shim(&s.bin, "npm", "npm", &s.log, "exit 0");
+    let (outcome, reason) = run_owner_action(&action(&program, &Npm));
+    assert_eq!(outcome, Outcome::Applied, "{reason}");
+    assert_eq!(
+        read_log(&s.log),
+        vec!["npm\tcache\tclean\t--force".to_owned()]
     );
 }
 
 #[test]
-fn whitelisted_npm_cache_is_skipped_without_cleaning() {
+fn failing_owner_clean_is_failed() {
     let s = sandbox();
-    let cache = s.home.join(".npm");
-    let config = s.home.join(".config/mole-linux");
-    fs::create_dir_all(&config).expect("config dir");
-    fs::write(config.join("whitelist"), format!("{}\n", cache.display())).expect("whitelist");
-    let xdg = XdgPaths::from_values(s.home.clone(), None, None, None, None).expect("xdg");
-    let mut env = s.env(&s.bin);
-    env.whitelist = Whitelist::load(&xdg).expect("whitelist load");
-    write_shim(
-        &s.bin,
-        "npm",
-        "npm",
-        &s.log,
-        &format!(
-            "case \"$*\" in '--version') echo 10.9.0;; 'config get cache') echo '{}';; esac",
-            cache.display()
-        ),
-    );
-    let reports = run_adapter(&Npm, &env, RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Skipped, "{reports:?}");
-    let calls = read_log(&s.log);
-    assert!(
-        calls.iter().all(|call| !call.contains("cache\tclean")),
-        "{calls:?}"
-    );
-}
-
-#[test]
-fn failing_npm_clean_is_failed_not_applied() {
-    let s = sandbox();
-    write_shim(
-        &s.bin,
-        "npm",
-        "npm",
-        &s.log,
-        &format!(
-            "case \"$*\" in '--version') echo 10.9.0;; 'config get cache') echo '{}/.npm';; 'cache clean --force') exit 3;; esac",
-            s.home.display()
-        ),
-    );
-    let reports = run_adapter(&Npm, &s.env(&s.bin), RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Failed, "{reports:?}");
+    let program = write_shim(&s.bin, "npm", "npm", &s.log, "exit 3");
+    let (outcome, reason) = run_owner_action(&action(&program, &Npm));
+    assert_eq!(outcome, Outcome::Failed, "{reason}");
 }
 
 #[test]
 fn hung_owner_command_is_killed_and_reported_unavailable() {
     let s = sandbox();
-    write_shim(
-        &s.bin,
-        "npm",
-        "npm",
-        &s.log,
-        &format!(
-            "case \"$*\" in '--version') echo 10.9.0;; 'config get cache') echo '{}/.npm';; 'cache clean --force') sleep 30;; esac",
-            s.home.display()
-        ),
-    );
-    let mut env = s.env(&s.bin);
-    env.clean_timeout = Duration::from_millis(300);
+    let program = write_shim(&s.bin, "npm", "npm", &s.log, "sleep 30");
+    let short = OwnerAction {
+        program: program.clone(),
+        args: Npm.clean_args(),
+        timeout: Duration::from_millis(300),
+    };
     let started = Instant::now();
-    let reports = run_adapter(&Npm, &env, RunMode::Apply);
+    let (outcome, reason) = run_owner_action(&short);
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "timeout not enforced"
     );
-    assert_eq!(only(&reports).outcome, Outcome::Unavailable, "{reports:?}");
-    assert!(only(&reports).reason.contains("timed out"), "{reports:?}");
+    assert_eq!(outcome, Outcome::Unavailable, "{reason}");
+    assert!(reason.contains("timed out"), "{reason}");
 }
 
 // --- pnpm ------------------------------------------------------------------
 
 #[test]
-fn pnpm_prunes_each_distinct_store_from_path_and_mise_installs() {
+fn pnpm_resolves_each_distinct_store_from_path_and_mise_installs() {
     let s = sandbox();
     let v11 = s.home.join("Library/pnpm/store/v11");
     let v10 = s.home.join(".local/share/pnpm/store/v10");
@@ -315,41 +258,12 @@ fn pnpm_prunes_each_distinct_store_from_path_and_mise_installs() {
             v10.display()
         ),
     );
-    let reports = run_adapter(&Pnpm, &s.env(&s.bin), RunMode::Apply);
-    assert_eq!(reports.len(), 2, "{reports:?}");
-    assert!(
-        reports.iter().all(|r| r.outcome == Outcome::Applied),
-        "{reports:?}"
-    );
-    let calls = read_log(&s.log);
-    assert!(
-        calls.contains(&"pnpm11\tstore\tprune".to_owned()),
-        "{calls:?}"
-    );
-    assert!(
-        calls.contains(&"pnpm10\tstore\tprune".to_owned()),
-        "{calls:?}"
-    );
-}
-
-#[test]
-fn pnpm_same_store_from_two_binaries_is_pruned_once() {
-    let s = sandbox();
-    let store = s.home.join("Library/pnpm/store/v11");
-    let body = format!(
-        "case \"$*\" in '--version') echo 11.17.0;; 'store path') echo '{}';; esac",
-        store.display()
-    );
-    write_shim(&s.bin, "pnpm", "pnpm-path", &s.log, &body);
-    let mise = s.home.join(".local/share/mise/installs/pnpm/11.17.0");
-    write_shim(&mise, "pnpm", "pnpm-mise", &s.log, &body);
-    let reports = run_adapter(&Pnpm, &s.env(&s.bin), RunMode::Apply);
-    assert_eq!(reports.len(), 1, "{reports:?}");
-    let prunes = read_log(&s.log)
+    let results = resolve(&Pnpm, &s.env(&s.bin)).expect("resolve");
+    let targets: Vec<PathBuf> = results
         .into_iter()
-        .filter(|call| call.ends_with("store\tprune"))
-        .count();
-    assert_eq!(prunes, 1, "one store, one prune");
+        .map(|result| result.expect("usable binary").target)
+        .collect();
+    assert_eq!(targets, vec![v11, v10]);
 }
 
 #[test]
@@ -362,17 +276,21 @@ fn pnpm_store_path_with_parent_traversal_is_refused() {
         &s.log,
         "case \"$*\" in '--version') echo 11.0.0;; 'store path') echo '/home/x/../etc';; esac",
     );
-    let reports = run_adapter(&Pnpm, &s.env(&s.bin), RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Unavailable, "{reports:?}");
-    let calls = read_log(&s.log);
-    assert!(
-        calls.iter().all(|call| !call.contains("prune")),
-        "{calls:?}"
-    );
+    let refusal = s.first(&Pnpm).expect_err("traversal");
+    assert_eq!(refusal.outcome, Outcome::Unavailable, "{refusal:?}");
 }
 
 #[test]
-fn running_pnpm_started_by_node_is_skipped() {
+fn pnpm_store_prune_action_runs_owner_prune() {
+    let s = sandbox();
+    let program = write_shim(&s.bin, "pnpm", "pnpm", &s.log, "exit 0");
+    let (outcome, reason) = run_owner_action(&action(&program, &Pnpm));
+    assert_eq!(outcome, Outcome::Applied, "{reason}");
+    assert_eq!(read_log(&s.log), vec!["pnpm\tstore\tprune".to_owned()]);
+}
+
+#[test]
+fn running_pnpm_started_by_node_is_refused() {
     let s = sandbox();
     write_shim(&s.bin, "pnpm", "pnpm", &s.log, "echo 11.0.0");
     fake_process(
@@ -380,15 +298,15 @@ fn running_pnpm_started_by_node_is_skipped() {
         7001,
         &["node", "/usr/lib/corepack/dist/pnpm.cjs", "install"],
     );
-    let reports = run_adapter(&Pnpm, &s.env(&s.bin), RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Skipped, "{reports:?}");
+    let refusal = resolve(&Pnpm, &s.env(&s.bin)).expect_err("busy pnpm");
+    assert_eq!(refusal.outcome, Outcome::Skipped, "{refusal:?}");
     assert!(read_log(&s.log).is_empty());
 }
 
 // --- bun -------------------------------------------------------------------
 
 #[test]
-fn bun_apply_runs_owner_pm_cache_rm() {
+fn bun_resolves_the_cache_bun_reports() {
     let s = sandbox();
     let cache = s.home.join(".bun/install/cache");
     write_shim(
@@ -401,17 +319,27 @@ fn bun_apply_runs_owner_pm_cache_rm() {
             cache.display()
         ),
     );
-    let reports = run_adapter(&Bun, &s.env(&s.bin), RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Applied, "{reports:?}");
-    let calls = read_log(&s.log);
-    assert!(
-        calls.contains(&"bun\tpm\tcache\trm".to_owned()),
-        "{calls:?}"
-    );
+    assert_eq!(s.first(&Bun).expect("bun resolves").target, cache);
 }
 
 #[test]
-fn bun_relative_cache_path_is_unavailable() {
+fn bun_cache_query_failure_is_refused_with_the_owner_status() {
+    let s = sandbox();
+    write_shim(
+        &s.bin,
+        "bun",
+        "bun",
+        &s.log,
+        "case \"$*\" in '--version') echo 1.4.2;; 'pm cache') exit 1;; esac",
+    );
+    let refusal = s.first(&Bun).expect_err("query failed");
+    assert_eq!(refusal.outcome, Outcome::Unavailable, "{refusal:?}");
+    assert!(refusal.reason.contains("pm cache"), "{refusal:?}");
+    assert!(read_log(&s.log).iter().all(|call| !call.contains("rm")));
+}
+
+#[test]
+fn bun_relative_cache_path_is_refused() {
     let s = sandbox();
     write_shim(
         &s.bin,
@@ -420,42 +348,30 @@ fn bun_relative_cache_path_is_unavailable() {
         &s.log,
         "case \"$*\" in '--version') echo 1.4.2;; 'pm cache') echo 'cache';; esac",
     );
-    let reports = run_adapter(&Bun, &s.env(&s.bin), RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Unavailable, "{reports:?}");
-    let calls = read_log(&s.log);
-    assert!(calls.iter().all(|call| !call.contains("rm")), "{calls:?}");
+    let refusal = s.first(&Bun).expect_err("relative");
+    assert_eq!(refusal.outcome, Outcome::Unavailable, "{refusal:?}");
 }
 
 #[test]
-fn failing_bun_rm_is_failed_with_no_filesystem_fallback() {
+fn bun_cache_rm_failure_is_failed_and_deletes_nothing_itself() {
     let s = sandbox();
     let cache = s.home.join(".bun/install/cache");
     fs::create_dir_all(&cache).expect("cache dir");
     fs::write(cache.join("pkg.tgz"), b"cached").expect("cache entry");
-    write_shim(
-        &s.bin,
-        "bun",
-        "bun",
-        &s.log,
-        &format!(
-            "case \"$*\" in '--version') echo 1.4.2;; 'pm cache') echo '{}';; 'pm cache rm') exit 1;; esac",
-            cache.display()
-        ),
-    );
-    let reports = run_adapter(&Bun, &s.env(&s.bin), RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Failed, "{reports:?}");
+    let program = write_shim(&s.bin, "bun", "bun", &s.log, "exit 1");
+    let (outcome, _) = run_owner_action(&action(&program, &Bun));
+    assert_eq!(outcome, Outcome::Failed);
     assert!(
         cache.join("pkg.tgz").exists(),
-        "adapter must never delete files itself"
+        "the adapter must never delete files itself"
     );
 }
 
 // --- corepack --------------------------------------------------------------
 
 #[test]
-fn corepack_suppresses_download_prompt_for_version_and_clean() {
+fn corepack_probe_suppresses_the_download_prompt() {
     let s = sandbox();
-    // The shim records the env it actually sees, so a missing setting shows as UNSET.
     write_shim(
         &s.bin,
         "corepack",
@@ -466,15 +382,11 @@ fn corepack_suppresses_download_prompt_for_version_and_clean() {
             s.log.display()
         ),
     );
-    let reports = run_adapter(&Corepack, &s.env(&s.bin), RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Applied, "{reports:?}");
+    let resolved = s.first(&Corepack).expect("corepack resolves");
+    assert_eq!(resolved.target, s.home.join(".cache/node/corepack"));
     let calls = read_log(&s.log);
     assert!(
         calls.contains(&"corepack\t--version".to_owned()),
-        "{calls:?}"
-    );
-    assert!(
-        calls.contains(&"corepack\tcache\tclean".to_owned()),
         "{calls:?}"
     );
     let envs: Vec<&String> = calls.iter().filter(|c| c.starts_with("env:")).collect();
@@ -492,29 +404,11 @@ fn corepack_missing_is_unavailable_and_never_deletes_its_cache() {
     fs::create_dir_all(&cache).expect("corepack cache");
     fs::write(cache.join("pnpm.tgz"), b"cached").expect("cache entry");
     fs::create_dir_all(&s.bin).expect("empty PATH dir");
-    let reports = run_adapter(&Corepack, &s.env(&s.bin), RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Unavailable, "{reports:?}");
+    let refusal = resolve(&Corepack, &s.env(&s.bin)).expect_err("missing corepack");
+    assert_eq!(refusal.outcome, Outcome::Unavailable, "{refusal:?}");
     assert!(
         cache.join("pnpm.tgz").exists(),
         "missing owner must not delete"
-    );
-}
-
-#[test]
-fn corepack_home_defaults_under_home_cache_in_dry_run() {
-    let s = sandbox();
-    write_shim(&s.bin, "corepack", "corepack", &s.log, "echo 0.34.0");
-    let reports = run_adapter(&Corepack, &s.env(&s.bin), RunMode::DryRun);
-    let report = only(&reports);
-    assert_eq!(report.outcome, Outcome::Unchanged, "{reports:?}");
-    assert_eq!(
-        report.target.as_deref(),
-        Some(s.home.join(".cache/node/corepack").as_path())
-    );
-    let calls = read_log(&s.log);
-    assert!(
-        calls.iter().all(|call| !call.contains("clean")),
-        "{calls:?}"
     );
 }
 
@@ -524,13 +418,22 @@ fn corepack_home_at_filesystem_root_is_refused() {
     write_shim(&s.bin, "corepack", "corepack", &s.log, "echo 0.34.0");
     let mut env = s.env(&s.bin);
     env.corepack_home = Some(OsString::from("/"));
-    let reports = run_adapter(&Corepack, &env, RunMode::Apply);
-    assert_eq!(only(&reports).outcome, Outcome::Skipped, "{reports:?}");
-    let calls = read_log(&s.log);
-    assert!(
-        calls.iter().all(|call| !call.contains("clean")),
-        "{calls:?}"
-    );
+    let refusal = resolve(&Corepack, &env)
+        .expect("binary resolves")
+        .into_iter()
+        .next()
+        .expect("one binary")
+        .expect_err("root");
+    assert_eq!(refusal.outcome, Outcome::Skipped, "{refusal:?}");
+}
+
+#[test]
+fn corepack_clean_action_runs_owner_cache_clean() {
+    let s = sandbox();
+    let program = write_shim(&s.bin, "corepack", "corepack", &s.log, "exit 0");
+    let (outcome, _) = run_owner_action(&action(&program, &Corepack));
+    assert_eq!(outcome, Outcome::Applied);
+    assert_eq!(read_log(&s.log), vec!["corepack\tcache\tclean".to_owned()]);
 }
 
 // --- process probe ---------------------------------------------------------

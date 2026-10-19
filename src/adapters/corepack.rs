@@ -8,6 +8,10 @@ use crate::core::outcome::Outcome;
 pub struct Corepack;
 
 impl OwnerAdapter for Corepack {
+    fn rule_id(&self) -> &'static str {
+        "corepack"
+    }
+
     fn label(&self) -> &'static str {
         "Corepack cache"
     }

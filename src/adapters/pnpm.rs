@@ -11,8 +11,16 @@ use crate::core::privilege::is_executable_file;
 pub struct Pnpm;
 
 impl OwnerAdapter for Pnpm {
+    fn rule_id(&self) -> &'static str {
+        "pnpm"
+    }
+
     fn label(&self) -> &'static str {
-        "pnpm cache"
+        "pnpm store"
+    }
+
+    fn caveat(&self) -> Option<&'static str> {
+        Some("prune removes only unreferenced packages; size is the whole store")
     }
 
     fn program(&self) -> &'static str {

@@ -30,6 +30,7 @@ fn reviewed(path: PathBuf, activity: Activity, protected: bool) -> ReviewedCandi
         size: SizeEstimate::Known(4096),
         cachedir_tag: false,
         selected_by_default: activity == Activity::Old && !protected,
+        authored_content: false,
         unavailable_reason: None,
     })
     .expect("capture identity")
@@ -442,4 +443,124 @@ fn git_probe_waits_for_process_after_empty_stdout_closes() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn dry_run_lists_grouped_artifacts_allocated_sizes_and_selection_reasons() {
+    use std::process::Command;
+
+    let temp = tempdir().expect("temp home");
+    let home = temp.path().join("home");
+    let project = home.join("Workspace/project-name");
+    let dist = project.join("dist");
+    let modules = project.join("node_modules");
+    let target = project.join("target");
+    let vendor = project.join("vendor");
+    let odd_cache = project.join("odd\ncache");
+    for path in [&dist, &modules, &target, &vendor, &odd_cache] {
+        fs::create_dir_all(path).expect("artifact directory");
+    }
+    fs::write(project.join("Cargo.toml"), "[package]\nname='fixture'\n").expect("marker");
+    fs::write(dist.join("bundle.js"), vec![b'd'; 2_048]).expect("generated file");
+    fs::write(modules.join("package.js"), "recent").expect("recent file");
+    fs::write(target.join("source.rs"), "authored").expect("tracked file");
+    fs::write(vendor.join("dependency.txt"), "dependency").expect("vendor file");
+    fs::write(
+        odd_cache.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .expect("valid cache tag");
+    fs::write(odd_cache.join("recent"), "recent").expect("recent cache file");
+    let initialized = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&project)
+        .status()
+        .expect("git init");
+    assert!(initialized.success());
+    let added = Command::new("git")
+        .args(["add", "target/source.rs"])
+        .current_dir(&project)
+        .status()
+        .expect("git add");
+    assert!(added.success());
+    age(&[
+        &dist,
+        &dist.join("bundle.js"),
+        &target,
+        &target.join("source.rs"),
+        &vendor,
+        &vendor.join("dependency.txt"),
+    ]);
+
+    let root = project.to_string_lossy().into_owned();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mole-linux"));
+    command.args(["purge", "--dry-run", "--paths", &root]);
+    command.isolated_home(&home);
+    let output = command.output().expect("run purge preview");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Project: ~/Workspace/project-name"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("dist"), "{stdout}");
+    assert!(stdout.contains("node_modules"), "{stdout}");
+    assert!(stdout.contains("target"), "{stdout}");
+    assert!(stdout.contains("vendor"), "{stdout}");
+    assert!(stdout.contains("odd\\ncache"), "{stdout}");
+    assert!(stdout.contains("kB allocated"), "{stdout}");
+    assert!(stdout.contains("selected by default"), "{stdout}");
+    assert!(stdout.contains("recent activity"), "{stdout}");
+    assert!(stdout.contains("authored content"), "{stdout}");
+    assert!(stdout.contains("protected"), "{stdout}");
+    assert!(stdout.contains("Selected total: 1 artifact(s)"), "{stdout}");
+    assert!(
+        stdout.contains("Trash does not free space until emptied"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn dry_run_preview_never_groups_under_a_dotfiles_repo_above_home() {
+    use std::process::Command;
+
+    let temp = tempdir().expect("temp home");
+    let home = temp.path().join("home");
+    let dotfiles = home.join(".git");
+    let project = home.join("Workspace/project-name");
+    let target = project.join("target");
+    fs::create_dir_all(&home).expect("home");
+    let initialized = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&home)
+        .status()
+        .expect("git init");
+    assert!(initialized.success());
+    assert!(dotfiles.is_dir());
+    fs::create_dir_all(&target).expect("artifact directory");
+    fs::write(project.join("Cargo.toml"), "[package]\nname='fixture'\n").expect("marker");
+    fs::write(target.join("build.o"), vec![b'o'; 2_048]).expect("generated file");
+    age(&[&target, &target.join("build.o")]);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mole-linux"));
+    command.args(["purge", "--dry-run", "--paths", &project.to_string_lossy()]);
+    command.isolated_home(&home);
+    let output = command.output().expect("run purge preview");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "Project: ~/Workspace/project-name"),
+        "{stdout}"
+    );
+    assert!(!stdout.lines().any(|line| line == "Project: ~"), "{stdout}");
 }

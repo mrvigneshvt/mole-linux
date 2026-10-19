@@ -63,18 +63,29 @@ fn size_timeout_and_filesystem_errors_are_unknown_not_zero() {
     let path = home.path().join("tree");
     fs::create_dir_all(&path).expect("tree");
     fs::write(path.join("file"), [0_u8; 8]).expect("file");
+    use std::os::unix::fs::MetadataExt;
+    let expected_allocated = fs::metadata(&path)
+        .expect("tree metadata")
+        .blocks()
+        .checked_add(
+            fs::metadata(path.join("file"))
+                .expect("file metadata")
+                .blocks(),
+        )
+        .and_then(|blocks| blocks.checked_mul(512))
+        .expect("allocated bytes");
     assert_eq!(
         measure_size_with_budget(&path, Duration::from_secs(2)),
-        SizeEstimate::Known(8)
+        SizeEstimate::Known(expected_allocated)
     );
-    assert_eq!(
+    assert!(matches!(
         measure_size_with_budget(&path, Duration::ZERO),
-        SizeEstimate::Unknown
-    );
-    assert_eq!(
+        SizeEstimate::Unknown(reason) if reason.contains("time budget")
+    ));
+    assert!(matches!(
         measure_size_with_budget(&home.path().join("missing"), Duration::from_secs(2)),
-        SizeEstimate::Unknown
-    );
+        SizeEstimate::Unknown(reason) if reason.contains("metadata")
+    ));
 }
 
 fn filetime_old(path: &std::path::Path) {

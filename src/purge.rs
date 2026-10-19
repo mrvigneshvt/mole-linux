@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -93,6 +94,7 @@ pub struct Candidate {
     pub size: SizeEstimate,
     pub cachedir_tag: bool,
     pub selected_by_default: bool,
+    pub authored_content: bool,
     pub unavailable_reason: Option<String>,
 }
 
@@ -103,10 +105,10 @@ pub enum Activity {
     Uncertain,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SizeEstimate {
     Known(u64),
-    Unknown,
+    Unknown(String),
 }
 
 /// Reads explicit roots; missing, empty, or comment-only files use the
@@ -660,14 +662,15 @@ fn collect_artifacts(
         }
         let cachedir_tag = has_valid_cachedir_tag(&path)?;
         if TARGETS.contains(&entry.file_name().to_string_lossy().as_ref()) || cachedir_tag {
-            let (protected_content, unavailable_reason) =
+            let (authored_content, unavailable_reason) =
                 match has_authored_content_with_budget(&path, remaining(deadline)) {
                     Ok(protected) => (protected, None),
-                    Err(error) => (true, Some(error.to_string())),
+                    Err(error) => (false, Some(error.to_string())),
                 };
             let activity =
                 classify_activity_with_budget(&path, SystemTime::now(), remaining(deadline));
-            let protected = protected_content
+            let protected = authored_content
+                || unavailable_reason.is_some()
                 || is_protected_artifact(&path)
                 || activity == Activity::Uncertain;
             found.push(Candidate {
@@ -676,6 +679,7 @@ fn collect_artifacts(
                 size: measure_size_with_budget(&path, remaining(deadline)),
                 cachedir_tag,
                 selected_by_default: activity == Activity::Old && !protected,
+                authored_content,
                 unavailable_reason,
                 path,
             });
@@ -763,29 +767,51 @@ pub fn measure_size_with_budget(path: &Path, budget: Duration) -> SizeEstimate {
     let mut total = 0_u64;
     while let Some(current) = pending.pop() {
         if check_deadline(deadline).is_err() {
-            return SizeEstimate::Unknown;
+            return SizeEstimate::Unknown("size calculation exceeded its time budget".to_owned());
         }
-        let Ok(metadata) = fs::symlink_metadata(&current) else {
-            return SizeEstimate::Unknown;
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return SizeEstimate::Unknown(format!("could not read metadata: {error}"));
+            }
         };
-        if metadata.is_file() {
-            let Some(size) = total.checked_add(metadata.len()) else {
-                return SizeEstimate::Unknown;
+        if metadata.is_file() || metadata.is_dir() {
+            let Some(allocated) = metadata.blocks().checked_mul(512) else {
+                return SizeEstimate::Unknown("allocated byte count overflowed".to_owned());
+            };
+            let Some(size) = total.checked_add(allocated) else {
+                return SizeEstimate::Unknown("allocated size total overflowed".to_owned());
             };
             total = size;
-        } else if metadata.is_dir() {
-            let Ok(entries) = fs::read_dir(current) else {
-                return SizeEstimate::Unknown;
+        }
+        if metadata.is_dir() {
+            let entries = match fs::read_dir(&current) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    return SizeEstimate::Unknown(format!("could not read directory: {error}"));
+                }
             };
             for entry in entries {
                 if check_deadline(deadline).is_err() {
-                    return SizeEstimate::Unknown;
+                    return SizeEstimate::Unknown(
+                        "size calculation exceeded its time budget".to_owned(),
+                    );
                 }
-                let Ok(entry) = entry else {
-                    return SizeEstimate::Unknown;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        return SizeEstimate::Unknown(format!(
+                            "could not read directory entry: {error}"
+                        ));
+                    }
                 };
-                let Ok(file_type) = entry.file_type() else {
-                    return SizeEstimate::Unknown;
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(error) => {
+                        return SizeEstimate::Unknown(format!(
+                            "could not inspect directory entry: {error}"
+                        ));
+                    }
                 };
                 if file_type.is_dir() || file_type.is_file() {
                     pending.push(entry.path());

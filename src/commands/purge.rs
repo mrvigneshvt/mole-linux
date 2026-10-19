@@ -1,4 +1,5 @@
 // Ported from tw93/Mole lib/clean/project.sh:clean_project_artifacts (GPL-3.0).
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -255,6 +256,10 @@ pub fn run(dry_run: bool, paths: Option<String>, include_empty: bool, yes: bool)
                 visible_path(&path, &xdg.home),
                 visible_text(reason)
             );
+            match ReviewedCandidate::capture(candidate) {
+                Ok(item) => reviewed.push(item),
+                Err(error) => scan_errors.push((path, error)),
+            }
             continue;
         }
         if include_empty || candidate.size != SizeEstimate::Known(0) {
@@ -287,6 +292,9 @@ pub fn run(dry_run: bool, paths: Option<String>, include_empty: bool, yes: bool)
             .map(|item| item.candidate.path.clone())
             .collect()
     };
+    if dry_run {
+        print_preview(&reviewed, &selected, &xdg.home);
+    }
     if selected.is_empty() {
         println!("No artifacts selected.");
         return Ok(());
@@ -418,25 +426,14 @@ fn render_selection(
         .iter()
         .enumerate()
         .map(|(index, item)| {
-            let candidate = &item.candidate;
+            let row = artifact_row(&item.candidate);
             let mark = if selected[index] { "[x]" } else { "[ ]" };
-            let state = match candidate.activity {
-                Activity::Recent => "recent",
-                Activity::Old => "old",
-                Activity::Uncertain => "uncertain",
-            };
-            let protected = if candidate.protected {
-                " protected"
-            } else {
-                ""
-            };
-            let size = match candidate.size {
-                SizeEstimate::Known(bytes) => format_size(bytes),
-                SizeEstimate::Unknown => "size unknown".to_owned(),
-            };
             let line = format!(
-                "{mark} {} · {state}{protected} · {size}",
-                visible_path(&candidate.path, Path::new(""))
+                "{mark} {} · {} · {} · {}",
+                visible_text(&row.kind),
+                visible_path(&row.path, Path::new("")),
+                row.compact_reason,
+                row.allocated,
             );
             let style = if index == cursor {
                 Style::default()
@@ -467,6 +464,131 @@ fn render_selection(
         "Resize terminal: minimum 40×12"
     };
     frame.render_widget(Paragraph::new(footer), layout[1]);
+}
+
+#[derive(Clone, Debug)]
+struct ArtifactRow {
+    path: PathBuf,
+    kind: String,
+    allocated: String,
+    compact_reason: &'static str,
+    selection_reason: String,
+}
+
+fn artifact_row(candidate: &Candidate) -> ArtifactRow {
+    let kind = candidate
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "artifact".to_owned());
+    let selection_reason = if let Some(reason) = &candidate.unavailable_reason {
+        format!(
+            "not selected by default (unavailable: {})",
+            visible_text(reason)
+        )
+    } else if candidate.authored_content {
+        "not selected by default (authored content)".to_owned()
+    } else if candidate.activity == Activity::Uncertain {
+        "not selected by default (uncertain activity)".to_owned()
+    } else if candidate.protected {
+        "not selected by default (protected)".to_owned()
+    } else if candidate.activity == Activity::Recent {
+        "not selected by default (recent activity)".to_owned()
+    } else if candidate.selected_by_default {
+        "selected by default (old activity)".to_owned()
+    } else {
+        "not selected by default (not eligible)".to_owned()
+    };
+    let compact_reason = if candidate.unavailable_reason.is_some() {
+        "unavailable"
+    } else if candidate.authored_content {
+        "authored content"
+    } else if candidate.activity == Activity::Uncertain {
+        "uncertain activity"
+    } else if candidate.protected {
+        "protected"
+    } else if candidate.activity == Activity::Recent {
+        "recent"
+    } else if candidate.selected_by_default {
+        "selected by default"
+    } else {
+        "not selected"
+    };
+    let allocated = match &candidate.size {
+        SizeEstimate::Known(bytes) => format!("{} allocated", format_size(*bytes)),
+        SizeEstimate::Unknown(reason) => {
+            format!("Unknown allocated size ({})", visible_text(reason))
+        }
+    };
+    ArtifactRow {
+        path: candidate.path.clone(),
+        kind,
+        allocated,
+        compact_reason,
+        selection_reason,
+    }
+}
+
+fn print_preview(candidates: &[ReviewedCandidate], selected: &[PathBuf], home: &Path) {
+    let mut projects = BTreeMap::<PathBuf, Vec<(bool, ArtifactRow)>>::new();
+    let mut selected_allocated = 0_u64;
+    let mut unknown_sizes = 0_usize;
+    let mut overflowed = false;
+    for item in candidates {
+        let row = artifact_row(&item.candidate);
+        let is_selected = selected.contains(&row.path);
+        if is_selected {
+            match &item.candidate.size {
+                SizeEstimate::Known(bytes) => match selected_allocated.checked_add(*bytes) {
+                    Some(total) => selected_allocated = total,
+                    None => overflowed = true,
+                },
+                SizeEstimate::Unknown(_) => unknown_sizes = unknown_sizes.saturating_add(1),
+            }
+        }
+        let project_root = purge::find_project_root_for_artifact(&row.path, home)
+            .or_else(|| row.path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| row.path.clone());
+        projects
+            .entry(project_root)
+            .or_default()
+            .push((is_selected, row));
+    }
+
+    println!("Purge preview:");
+    for (project_root, rows) in projects {
+        println!("Project: {}", visible_path(&project_root, home));
+        for (is_selected, row) in rows {
+            let mark = if is_selected { "x" } else { " " };
+            println!(
+                "  [{mark}] {} ({}) | {} | {}",
+                visible_text(&row.kind),
+                visible_path(&row.path, home),
+                row.allocated,
+                row.selection_reason
+            );
+        }
+    }
+    if overflowed {
+        println!(
+            "Selected total: {} artifact(s); allocated total Unknown (byte total overflowed).",
+            selected.len()
+        );
+    } else if unknown_sizes == 0 {
+        println!(
+            "Selected total: {} artifact(s), {} allocated.",
+            selected.len(),
+            format_size(selected_allocated)
+        );
+    } else {
+        println!(
+            "Selected total: {} artifact(s), {} allocated known; {} artifact(s) have Unknown size.",
+            selected.len(),
+            format_size(selected_allocated),
+            unknown_sizes
+        );
+    }
+    println!("Trash does not free space until emptied.");
 }
 
 fn format_size(bytes: u64) -> String {
@@ -538,6 +660,7 @@ mod tests {
             size: SizeEstimate::Known(2048),
             cachedir_tag: false,
             selected_by_default: false,
+            authored_content: false,
             unavailable_reason: None,
         })
         .expect("capture candidate");
@@ -590,6 +713,7 @@ mod tests {
                     size: SizeEstimate::Known(1024),
                     cachedir_tag: false,
                     selected_by_default: index != 0,
+                    authored_content: false,
                     unavailable_reason: None,
                 })
                 .expect("capture candidate"),
@@ -626,6 +750,7 @@ mod tests {
             size: SizeEstimate::Known(1),
             cachedir_tag: false,
             selected_by_default: true,
+            authored_content: false,
             unavailable_reason: None,
         })
         .expect("capture candidate");
@@ -654,5 +779,24 @@ mod added_display_regression {
             visible_path(Path::new("/home/test/Workspace"), Path::new("/home/test")),
             "~/Workspace"
         );
+    }
+
+    #[test]
+    fn artifact_rows_explain_uncertain_activity_and_unknown_allocated_size() {
+        let candidate = Candidate {
+            path: PathBuf::from("/tmp/project/target"),
+            activity: Activity::Uncertain,
+            protected: true,
+            size: SizeEstimate::Unknown("size calculation exceeded its time budget".to_owned()),
+            cachedir_tag: false,
+            selected_by_default: false,
+            authored_content: false,
+            unavailable_reason: None,
+        };
+        let row = artifact_row(&candidate);
+        assert_eq!(row.kind, "target");
+        assert!(row.allocated.contains("Unknown allocated size"));
+        assert!(row.allocated.contains("time budget"));
+        assert!(row.selection_reason.contains("uncertain activity"));
     }
 }

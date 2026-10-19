@@ -7,3 +7,4 @@ pub mod purge;
 pub mod snapshots;
 pub mod status;
 pub mod uninstall;
+pub mod uninstall_leftovers;

@@ -45,6 +45,15 @@ struct HistorySession {
     malformed_summaries: u64,
     ambiguous: bool,
     actions: Actions,
+    records: Vec<OperationRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct OperationRecord {
+    action: String,
+    outcome: String,
+    path: String,
+    path_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -80,6 +89,7 @@ struct SessionBuilder {
     ambiguous: bool,
     marker_sequence: u64,
     actions: Actions,
+    records: Vec<OperationRecord>,
 }
 
 pub fn run(json: bool, limit: Option<usize>) -> io::Result<()> {
@@ -216,7 +226,7 @@ fn load_sessions(path: &Path) -> io::Result<Vec<HistorySession>> {
             active.remove(&key);
             continue;
         }
-        if let Some((timestamp, identity, action)) = parse_operation(line) {
+        if let Some((timestamp, identity, action, detail)) = parse_operation(line) {
             let Some((command, run_id)) = parse_identity(identity) else {
                 continue;
             };
@@ -235,6 +245,17 @@ fn load_sessions(path: &Path) -> io::Result<Vec<HistorySession>> {
             });
             let session = &mut sessions[index];
             session.operation_count = session.operation_count.saturating_add(1);
+            if let Some((outcome, path)) = parse_record_detail(detail)
+                && OUTCOME_NAMES.contains(&outcome)
+                && let Some(path_bytes) = decode_bytes(path)
+            {
+                session.records.push(OperationRecord {
+                    action: action.to_string(),
+                    outcome: outcome.to_string(),
+                    path: String::from_utf8_lossy(&path_bytes).into_owned(),
+                    path_bytes,
+                });
+            }
             let count = match action {
                 "REMOVED" => &mut session.actions.removed,
                 "TRASHED" => &mut session.actions.trashed,
@@ -278,6 +299,7 @@ fn load_sessions(path: &Path) -> io::Result<Vec<HistorySession>> {
             malformed_summaries: session.malformed_summaries,
             ambiguous: session.ambiguous,
             actions: session.actions,
+            records: session.records,
         })
         .collect())
 }
@@ -353,12 +375,41 @@ fn valid_timestamp(value: &str) -> bool {
             .all(|(index, byte)| [4, 7, 10, 13, 16].contains(&index) || byte.is_ascii_digit())
 }
 
-fn parse_operation(line: &str) -> Option<(&str, &str, &str)> {
+fn parse_operation(line: &str) -> Option<(&str, &str, &str, &str)> {
     let rest = line.strip_prefix('[')?;
     let (timestamp, rest) = rest.split_once("] [")?;
     let (command, rest) = rest.split_once("] ")?;
-    let (action, _) = rest.split_once(' ')?;
-    Some((timestamp, command, action))
+    let (action, detail) = rest.split_once(' ')?;
+    Some((timestamp, command, action, detail))
+}
+
+fn parse_record_detail(detail: &str) -> Option<(&str, &str)> {
+    let (outcome, path) = detail.split_once(' ')?;
+    Some((outcome, path))
+}
+
+fn decode_bytes(field: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(field.len());
+    let bytes = field.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 3 < bytes.len() && bytes[index + 1] == b'x' {
+            let hex = std::str::from_utf8(&bytes[index + 2..index + 4]).ok()?;
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 4;
+                continue;
+            }
+        }
+        if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'\\') {
+            out.push(b'\\');
+            index += 2;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    Some(out)
 }
 
 // Ported from tw93/Mole lib/core/history.sh:history_load_deletions (GPL-3.0).
@@ -494,7 +545,7 @@ impl OpLog {
 }
 
 impl Session {
-    pub fn record(&mut self, action: &str, outcome: &str, path: &str) -> io::Result<()> {
+    pub fn record(&mut self, action: &str, outcome: &str, path: &Path) -> io::Result<()> {
         if !OUTCOME_NAMES.contains(&outcome) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -516,7 +567,7 @@ impl Session {
                 escape_field(&identity),
                 escape_field(action),
                 escape_field(outcome),
-                escape_field(path)
+                escape_path(path)
             ),
         )
     }
@@ -603,23 +654,7 @@ fn append_deletion_to(
     )
 }
 
-/// Starts a session using the upstream operation-log marker format.
-pub fn start_session(command: &str, timestamp: &str) -> io::Result<()> {
-    let paths = log_paths()?;
-    start_session_to(&paths.operations, command, timestamp)
-}
-
-/// Records one action in a session using the upstream operation-log format.
-pub fn record_operation(
-    timestamp: &str,
-    command: &str,
-    action: &str,
-    detail: &str,
-) -> io::Result<()> {
-    let paths = log_paths()?;
-    append_operation_to(&paths.operations, timestamp, command, action, detail)
-}
-
+#[cfg(test)]
 fn append_operation_to(
     log_path: &Path,
     timestamp: &str,
@@ -639,12 +674,7 @@ fn append_operation_to(
     )
 }
 
-/// Ends a session with its summary using the upstream operation-log format.
-pub fn end_session(command: &str, timestamp: &str, items: u64, size: &str) -> io::Result<()> {
-    let paths = log_paths()?;
-    end_session_to(&paths.operations, command, timestamp, items, size)
-}
-
+#[cfg(test)]
 fn start_session_to(log_path: &Path, command: &str, timestamp: &str) -> io::Result<()> {
     append_line(
         log_path,
@@ -656,6 +686,7 @@ fn start_session_to(log_path: &Path, command: &str, timestamp: &str) -> io::Resu
     )
 }
 
+#[cfg(test)]
 fn end_session_to(
     log_path: &Path,
     command: &str,
@@ -692,6 +723,33 @@ fn escape_field(value: &str) -> String {
             escaped.push_str("\\\\");
         } else {
             escaped.push(character);
+        }
+    }
+    escaped
+}
+
+fn escape_path(path: &Path) -> String {
+    escape_bytes(path.as_os_str().as_encoded_bytes())
+}
+
+fn escape_bytes(bytes: &[u8]) -> String {
+    let mut escaped = String::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                escaped.push_str(&escape_field(valid));
+                break;
+            }
+            Err(error) => {
+                let valid = &remaining[..error.valid_up_to()];
+                escaped.push_str(&escape_field(std::str::from_utf8(valid).unwrap_or("")));
+                let invalid_len = error.error_len().unwrap_or(remaining.len() - valid.len());
+                for byte in &remaining[valid.len()..valid.len() + invalid_len] {
+                    escaped.push_str(&format!("\\x{byte:02x}"));
+                }
+                remaining = &remaining[valid.len() + invalid_len..];
+            }
         }
     }
     escaped
@@ -756,6 +814,14 @@ fn render_text(history: &History) {
         if session.ambiguous {
             println!("             legacy run attribution unknown run");
         }
+        for record in &session.records {
+            println!(
+                "             {} {} {}",
+                visible(&record.action),
+                visible(&record.outcome),
+                escape_bytes(&record.path_bytes)
+            );
+        }
     }
     println!("\nDeletion audit");
     if history.deletions.is_empty() {
@@ -801,6 +867,7 @@ mod tests {
         append_operation_to, end_session_to, escape_field, load_deletions, load_sessions,
         read_tail, start_session_to,
     };
+    use std::path::Path;
 
     #[test]
     fn large_log_tail_is_bounded_before_parsing() {
@@ -875,11 +942,15 @@ mod tests {
         let log = OpLog::with_state_home(directory.path());
         let mut session = log.start_session("clean", true).expect("start preview");
         session
-            .record("TASK_FAILED", "failed", "/tmp/path\twith-control")
+            .record(
+                "TASK_FAILED",
+                "failed",
+                Path::new("/tmp/path\twith-control"),
+            )
             .expect("record outcome");
         for outcome in OUTCOME_NAMES {
             session
-                .record("STATE", outcome, "/tmp/outcome")
+                .record("STATE", outcome, Path::new("/tmp/outcome"))
                 .expect("record canonical outcome");
         }
         session
@@ -907,6 +978,40 @@ mod tests {
             .expect("load written session");
         assert_eq!(sessions[0].command, "clean-dry-run");
         assert_eq!(sessions[0].failed_tasks, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_writer_round_trips_non_utf8_paths_in_history_json() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let log = OpLog::with_state_home(directory.path());
+        let mut session = log.start_session("clean", false).expect("start session");
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/name-\xff".to_vec()));
+        session
+            .record("REMOVED", "applied", &path)
+            .expect("record path");
+        session
+            .end(&SessionSummary {
+                items: 1,
+                size: "1KB".to_string(),
+            })
+            .expect("end session");
+
+        let operations = directory.path().join("mole-linux/operations.log");
+        let bytes = std::fs::read(&operations).expect("read operations log");
+        assert!(bytes.windows(4).any(|window| window == b"\\xff"));
+        assert!(!bytes.contains(&0xff));
+        assert_eq!(super::escape_path(&path), "/tmp/name-\\xff");
+        let sessions = load_sessions(&operations).expect("load session");
+        let json = serde_json::to_value(&sessions[0]).expect("serialize history");
+        assert_eq!(json["records"][0]["path"], "/tmp/name-�");
+        assert_eq!(
+            json["records"][0]["path_bytes"],
+            serde_json::json!([47, 116, 109, 112, 47, 110, 97, 109, 101, 45, 255])
+        );
     }
 
     #[test]

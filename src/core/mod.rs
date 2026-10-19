@@ -1,6 +1,6 @@
 pub mod fsutil;
-pub mod outcome;
 pub mod oplog;
+pub mod outcome;
 pub mod paths;
 pub mod proc;
 pub mod sink;

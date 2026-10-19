@@ -4,7 +4,7 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
@@ -144,6 +144,35 @@ impl OwnerRunner {
         }
     }
 
+    /// The exact argv `run` would execute for `cmd`, for consent prompts and dry-run output.
+    pub fn argv(&self, cmd: &OwnerCommand) -> Vec<OsString> {
+        cmd.argv(&self.bin_dir, &self.sudo)
+    }
+
+    /// Runs an unprivileged read-only query and returns its stdout. Queries never use sudo.
+    pub fn probe(&self, cmd: &OwnerCommand) -> Result<String, String> {
+        if cmd.needs_root {
+            return Err("owner query never runs with sudo".to_owned());
+        }
+        let program = cmd.program.path_in(&self.bin_dir);
+        if !is_executable_file(&program) {
+            return Err(format!(
+                "{} is missing or not executable",
+                program.display()
+            ));
+        }
+        // ponytail: stdout is read whole; paccache's dry-run summary is one line. Upgrade path: a capped reader that kills the child on overflow. Logged in KNOWN-GAPS.md.
+        let output = Process::new(&program)
+            .args(&cmd.args)
+            .output()
+            .map_err(|error| format!("could not start {}: {error}", program.display()))?;
+        if !output.status.success() {
+            return Err(format!("exited with {}", output.status));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|_| format!("{} printed non-UTF-8 output", program.display()))
+    }
+
     pub fn run(
         &mut self,
         cmd: &OwnerCommand,
@@ -169,7 +198,6 @@ impl OwnerRunner {
                     "sudo is missing or not executable; owner action skipped",
                 );
             }
-            // ponytail: no terminal prompt yet; callers pass the consent closure. Upgrade path: a tty prompt wired by M6.2. Logged in KNOWN-GAPS.md.
             if self.consent == Consent::Unasked {
                 self.consent = if confirm() {
                     Consent::Granted
@@ -213,6 +241,32 @@ impl OwnerRunner {
             },
         }
     }
+}
+
+/// The single per-run consent prompt for owner actions. It lists every exact argv first.
+/// Without a terminal nothing can be asked, so consent is refused and nothing runs.
+pub fn ask_owner_consent(listing: &[Vec<OsString>]) -> bool {
+    if !io::stdin().is_terminal() {
+        eprintln!("owner actions need a terminal consent prompt or --yes; skipped");
+        return false;
+    }
+    println!("Owner actions need administrator access (sudo). Exact commands:");
+    for argv in listing {
+        let rendered: Vec<String> = argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().escape_debug().to_string())
+            .collect();
+        println!("  {}", rendered.join(" "));
+    }
+    print!("Run these commands with sudo? [y/N] ");
+    if io::stdout().flush().is_err() {
+        return false;
+    }
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
 }
 
 fn is_executable_file(path: &Path) -> bool {

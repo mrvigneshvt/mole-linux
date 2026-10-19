@@ -611,6 +611,7 @@ fn system_catalog_registers_pacman_and_aur_rules_in_the_system_category() {
         vec![
             "pacman-cache-keep3",
             "pacman-cache-uninstalled",
+            "orphan-packages",
             "aur-build-dirs",
             "journal",
         ]

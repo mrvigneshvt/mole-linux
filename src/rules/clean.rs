@@ -118,6 +118,23 @@ pub trait CleanRule: Send + Sync {
     fn owner_command(&self, _candidate: &Candidate) -> Option<OwnerCommand> {
         None
     }
+
+    /// Read-only report for the operator. Report-only rules return `Some`; candidate rules keep
+    /// the default. A report never adds candidates and never applies anything.
+    fn report_with_owner(&self, _ctx: &RuleContext<'_>, _owner: &OwnerRunner) -> Option<Report> {
+        None
+    }
+}
+
+/// What a report-only rule found. Each report is recorded as one outcome for the whole rule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Report {
+    /// Nothing needs the operator's attention.
+    Clear,
+    /// Lines for the operator; recorded as `attention`.
+    Findings(Vec<String>),
+    /// The report could not be made; recorded as `unavailable`, never as clear.
+    Unavailable(String),
 }
 
 /// Owner-dependent rules must preserve `Unknown`; it cannot authorize cleanup.

@@ -5,5 +5,6 @@ pub mod paths;
 pub mod privilege;
 pub mod proc;
 pub mod sink;
+pub mod units;
 pub mod validate;
 pub mod whitelist;

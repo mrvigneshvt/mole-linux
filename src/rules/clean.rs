@@ -8,6 +8,7 @@ use crate::core::paths::XdgPaths;
 use crate::core::privilege::{OwnerCommand, OwnerRunner};
 use crate::core::proc::ProcessState;
 use crate::core::sink::Identity;
+use crate::core::units::bytes_si;
 use crate::core::whitelist::Whitelist;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -333,7 +334,7 @@ impl CleanRule for CoredumpReportRule {
         value.allocated_size = None;
         value.report = Some(format!(
             "coredumpctl list count: {count}; readable size (SI): {}",
-            size.map_or_else(|| "Unknown".to_owned(), format_size_si)
+            size.map_or_else(|| "Unknown".to_owned(), bytes_si)
         ));
         Discovery {
             candidates: vec![value],
@@ -633,32 +634,15 @@ fn escaped_path(path: &Path) -> String {
         .collect()
 }
 
-fn format_size_si(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["kB", "MB", "GB", "TB", "PB", "EB"];
-    if bytes < 1000 {
-        return format!("{bytes} B");
-    }
-    let mut divisor = 1000_u64;
-    for (index, unit) in UNITS.iter().enumerate() {
-        if index == UNITS.len() - 1 || bytes < divisor.saturating_mul(1000) {
-            let whole = bytes / divisor;
-            let tenths = (bytes % divisor) / (divisor / 10);
-            return format!("{whole}.{tenths} {unit}");
-        }
-        divisor = divisor.saturating_mul(1000);
-    }
-    format!("{bytes} B")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::format_size_si;
+    use crate::core::units::bytes_si;
 
     #[test]
     fn coredump_sizes_use_si_units_across_u64_range() {
-        assert_eq!(format_size_si(999), "999 B");
-        assert_eq!(format_size_si(1_000), "1.0 kB");
-        assert_eq!(format_size_si(1_234_567), "1.2 MB");
-        assert_eq!(format_size_si(u64::MAX), "18.4 EB");
+        assert_eq!(bytes_si(999), "999 B");
+        assert_eq!(bytes_si(1_000), "1.0 kB");
+        assert_eq!(bytes_si(1_234_567), "1.2 MB");
+        assert_eq!(bytes_si(u64::MAX), "18.4 EB");
     }
 }

@@ -1,0 +1,20 @@
+Clean supported caches
+
+Usage: mole-linux clean [OPTIONS]
+
+Options:
+      --debug                    Enable debug output
+      --dry-run                  Preview every item without changing anything
+      --yes                      Skip the confirmation prompt; also grants sudo consent for owner-tool actions
+      --categories <CATEGORIES>  Run only these categories (comma-separated: user, browser, development, system)
+      --select <SELECT>          Select rule IDs or categories (e.g. `trash` empties Trash (irreversible); `user` includes it)
+      --exclude <EXCLUDE>        Skip these rule IDs or categories (comma-separated)
+      --external                 Reserved for external targets; the Linux catalog has none, so this exits with an error
+      --whitelist                Print the whitelist path and exit
+  -h, --help                     Print help
+
+Categories and rule IDs (for --categories, --select, --exclude):
+  browser      browser-cache
+  development  project-pycache, npm, pnpm, bun, corepack, uv, pip, conda, go, mise, editor-cached-data, editor-obsolete-extensions, ruby, perl, elixir, ocaml, shell-caches, network-caches, cicd-caches, docker, docker-build-cache, pyinstaller, pyenv-cache, poetry-cache, ruff-cache, mypy-cache, pytest-cache, cargo, gradle
+  system       coredumps, pacman-cache-keep3, pacman-cache-uninstalled, orphan-packages, aur-build-dirs, flatpak-unused-system, flatpak-unused-user, journal
+  user         user-essentials, trash

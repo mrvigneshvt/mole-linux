@@ -1,0 +1,11 @@
+Purge development artifacts
+
+Usage: mole-linux purge [OPTIONS]
+
+Options:
+      --debug          Enable debug output
+      --dry-run        Inspect artifacts without sending anything to Trash
+      --paths <PATHS>  Comma-separated project roots to scan
+      --include-empty  Include empty artifact directories in the inventory
+      --yes            Skip the final confirmation before sending selected artifacts to Trash
+  -h, --help           Print help

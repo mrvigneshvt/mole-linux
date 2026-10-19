@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::paths::XdgPaths;
 use crate::core::privilege::{OwnerCommand, OwnerProgram, OwnerRunner};
+use crate::core::units::parse_iec_size;
 use crate::rules::clean::{
     Candidate, Category, CleanRule, Discovery, DiscoveryStatus, OwnerCheck, RecoveryMode,
     RuleContext, candidate, owner_candidate_state,
@@ -86,6 +87,8 @@ impl CleanRule for PaccacheRule {
         let reason = format!("{count} package file(s): {}", self.reason);
         match candidate(&self.cache_dir, reason, RecoveryMode::OwnerNative, state) {
             Ok(mut found) => {
+                // A directory has no size of its own; the preview's figure is the logical size.
+                found.apparent_size = parse_dry_run_saved(&output);
                 found.owner_check = OwnerCheck::ProcessName("pacman".to_owned());
                 complete(vec![found])
             }
@@ -117,6 +120,15 @@ fn parse_dry_run(output: &str) -> Option<u64> {
         .next()?
         .parse()
         .ok()
+}
+
+/// The `disk space saved: 510.4 KiB` figure of a dry run; absent or unparseable is unknown.
+fn parse_dry_run_saved(output: &str) -> Option<u64> {
+    let line = output
+        .lines()
+        .find(|line| line.contains("finished dry run:"))?;
+    let figure = line.split("disk space saved:").nth(1)?;
+    parse_iec_size(figure.trim().trim_end_matches(')').trim())
 }
 
 /// Makepkg build directories (`src/`, `pkg/`) under each AUR cache entry. Git checkouts stay.
@@ -283,6 +295,20 @@ fn unavailable(reason: &str) -> Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dry_run_saved_figure_is_the_logical_size() {
+        assert_eq!(
+            parse_dry_run_saved(
+                "==> finished dry run: 1 candidates (disk space saved: 510.4 KiB)\n"
+            ),
+            Some(522_649)
+        );
+        assert_eq!(
+            parse_dry_run_saved("==> finished dry run: 2 candidates"),
+            None
+        );
+    }
 
     #[test]
     fn dry_run_parser_reads_counts_and_zero_message() {

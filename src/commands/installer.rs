@@ -10,6 +10,7 @@ use crate::core::oplog::{OpLog, SessionSummary};
 use crate::core::outcome::{Outcome, OutcomeLedger};
 use crate::core::paths::XdgPaths;
 use crate::core::sink::{DeleteMode, Identity, SinkContext, delete};
+use crate::core::units::bytes_si;
 use crate::core::whitelist::Whitelist;
 
 const DEFAULT_DEPTH: u32 = 2;
@@ -110,8 +111,8 @@ pub fn run(
         println!(
             "{}  apparent {}  allocated {}",
             display_path(&candidate.path),
-            format_disk_size(candidate.apparent_size),
-            format_disk_size(candidate.allocated_size)
+            bytes_si(candidate.apparent_size),
+            bytes_si(candidate.allocated_size)
         );
     }
     if inventory.unavailable_paths > 0 {
@@ -419,25 +420,6 @@ fn is_tar_name(name: &[u8]) -> bool {
 
 fn ends_ascii_case(value: &[u8], suffix: &[u8]) -> bool {
     value.len() >= suffix.len() && value[value.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-}
-
-fn format_disk_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
-    let mut value = bytes;
-    let mut unit = 0_usize;
-    let mut scale = 1_u64;
-    while value >= 1000 && unit + 1 < UNITS.len() {
-        value /= 1000;
-        scale *= 1000;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        let whole = value;
-        let tenth = (bytes % scale) / (scale / 10);
-        format!("{whole}.{tenth} {}", UNITS[unit])
-    }
 }
 
 fn zip_has_installer(path: &Path, budget: &mut ScanBudget) -> io::Result<bool> {

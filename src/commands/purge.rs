@@ -14,6 +14,7 @@ use crate::core::oplog::{OpLog, SessionSummary};
 use crate::core::outcome::{Outcome, OutcomeLedger};
 use crate::core::paths::XdgPaths;
 use crate::core::sink::{DeleteError, DeleteMode, Identity, SinkContext, delete};
+use crate::core::units::bytes_si;
 use crate::core::whitelist::Whitelist;
 use crate::purge::{self, Activity, Candidate, SizeEstimate};
 
@@ -515,7 +516,7 @@ fn artifact_row(candidate: &Candidate) -> ArtifactRow {
         "not selected"
     };
     let allocated = match &candidate.size {
-        SizeEstimate::Known(bytes) => format!("{} allocated", format_size(*bytes)),
+        SizeEstimate::Known(bytes) => format!("{} allocated", bytes_si(*bytes)),
         SizeEstimate::Unknown(reason) => {
             format!("Unknown allocated size ({})", visible_text(reason))
         }
@@ -578,35 +579,17 @@ fn print_preview(candidates: &[ReviewedCandidate], selected: &[PathBuf], home: &
         println!(
             "Selected total: {} artifact(s), {} allocated.",
             selected.len(),
-            format_size(selected_allocated)
+            bytes_si(selected_allocated)
         );
     } else {
         println!(
             "Selected total: {} artifact(s), {} allocated known; {} artifact(s) have Unknown size.",
             selected.len(),
-            format_size(selected_allocated),
+            bytes_si(selected_allocated),
             unknown_sizes
         );
     }
     println!("Trash does not free space until emptied.");
-}
-
-fn format_size(bytes: u64) -> String {
-    const KILOBYTE: u64 = 1_000;
-    const MEGABYTE: u64 = 1_000_000;
-    const GIGABYTE: u64 = 1_000_000_000;
-    let (unit, divisor) = if bytes >= GIGABYTE {
-        ("GB", GIGABYTE)
-    } else if bytes >= MEGABYTE {
-        ("MB", MEGABYTE)
-    } else if bytes >= KILOBYTE {
-        ("kB", KILOBYTE)
-    } else {
-        return format!("{bytes} B");
-    };
-    let whole = bytes / divisor;
-    let decimal = bytes % divisor / (divisor / 10);
-    format!("{whole}.{decimal} {unit}")
 }
 
 fn confirm(paths: &[PathBuf], home: &Path) -> io::Result<bool> {

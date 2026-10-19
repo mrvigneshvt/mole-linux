@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::core::proc::ProcessState;
 use crate::core::sink::Identity;
-use crate::purge::{discover_project_dirs, has_tracked_files};
+use crate::purge::{discover_project_dirs, find_project_root_for_artifact, has_tracked_files};
 use crate::rules::clean::{
     Candidate, Category, CleanRule, Discovery, DiscoveryStatus, OwnerCheck, RecoveryMode,
     RuleContext,
@@ -86,10 +86,6 @@ impl CleanRule for PyCacheRule {
         for root in &roots {
             let walk = find_pycache_dirs(root, ctx.cancel);
             incomplete.extend(walk.incomplete);
-            let root_name = root.file_name().map_or_else(
-                || root.display().to_string(),
-                |name| name.to_string_lossy().into_owned(),
-            );
             for dir in walk.caches {
                 match has_direct_bytecode(&dir) {
                     Ok(false) => continue,
@@ -103,10 +99,12 @@ impl CleanRule for PyCacheRule {
                     // Definitive keeps are not listed; upstream logs them. See KNOWN-GAPS.md.
                     Guard::Kept(_) => {}
                     Guard::Unknown(reason) => incomplete.push(reason),
-                    Guard::Clear(facts) => match candidate_for(&dir, &root_name, &facts) {
-                        Ok(candidate) => candidates.push(candidate),
-                        Err(reason) => incomplete.push(reason),
-                    },
+                    Guard::Clear(facts) => {
+                        match candidate_for(&dir, &owning_project(&dir, root, ctx.home), &facts) {
+                            Ok(candidate) => candidates.push(candidate),
+                            Err(reason) => incomplete.push(reason),
+                        }
+                    }
                 }
             }
         }
@@ -322,7 +320,25 @@ fn cache_guard(dir: &Path) -> Guard {
     }
 }
 
-fn candidate_for(dir: &Path, root_name: &str, facts: &TreeFacts) -> Result<Candidate, String> {
+/// The project a cache belongs to: the nearest project root above it (the purge grouping rule),
+/// else the directory directly under the search root that holds it, else the search root.
+fn owning_project(dir: &Path, root: &Path, home: &Path) -> String {
+    let owner = find_project_root_for_artifact(dir, home)
+        .or_else(|| {
+            // A cache sitting directly in the search root has no directory of its own to name.
+            let mut relative = dir.strip_prefix(root).ok()?.components();
+            let first = relative.next()?;
+            relative.next()?;
+            Some(root.join(first))
+        })
+        .unwrap_or_else(|| root.to_path_buf());
+    owner.file_name().map_or_else(
+        || owner.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+fn candidate_for(dir: &Path, project: &str, facts: &TreeFacts) -> Result<Candidate, String> {
     let identity = Identity::capture(dir)
         .map_err(|error: io::Error| format!("cannot identify {}: {error}", dir.display()))?;
     Ok(Candidate {
@@ -330,7 +346,7 @@ fn candidate_for(dir: &Path, root_name: &str, facts: &TreeFacts) -> Result<Candi
         identity,
         apparent_size: Some(facts.apparent),
         allocated_size: Some(facts.allocated),
-        reason: format!("Python bytecode cache in {root_name}"),
+        reason: format!("Python bytecode cache in {project}"),
         report: None,
         recovery: RecoveryMode::Regenerate,
         selected_by_default: true,

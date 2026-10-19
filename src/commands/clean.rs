@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
@@ -17,6 +17,7 @@ use crate::core::privilege::{
 };
 use crate::core::proc::{self, ProcessState};
 use crate::core::sink::{DeleteMode, Identity, SinkContext, delete};
+use crate::core::units::bytes_si;
 use crate::core::validate::validate_path_for_deletion;
 use crate::core::whitelist::Whitelist;
 use crate::rules::clean::{
@@ -68,6 +69,26 @@ impl Default for CleanSummary {
             cancelled: false,
         }
     }
+}
+
+/// The `clean --help` footer: the categories, and the rule IDs under each, that
+/// `--categories`, `--select` and `--exclude` accept.
+pub fn help_epilog() -> String {
+    let mut by_category = BTreeMap::<&'static str, Vec<String>>::new();
+    for rule in catalog() {
+        by_category
+            .entry(rule.category().as_str())
+            .or_default()
+            .push(rule.id().to_owned());
+    }
+    let lines: Vec<String> = by_category
+        .iter()
+        .map(|(category, ids)| format!("  {category:<12} {}", ids.join(", ")))
+        .collect();
+    format!(
+        "Categories and rule IDs (for --categories, --select, --exclude):\n{}",
+        lines.join("\n")
+    )
 }
 
 pub fn run(args: CleanArgs) -> io::Result<()> {
@@ -760,14 +781,10 @@ fn render_summary(
     );
     if !dry_run {
         match (before, after) {
-            (Ok(before), Ok(after)) if after >= before => println!(
-                "Measured statvfs free-space delta: +{} bytes",
-                after - before
-            ),
-            (Ok(before), Ok(after)) => println!(
-                "Measured statvfs free-space delta: -{} bytes",
-                before - after
-            ),
+            (Ok(before), Ok(after)) => match free_space_delta(before, after) {
+                Some(delta) => println!("Measured statvfs free-space delta: {delta}"),
+                None => println!("Measured statvfs free-space delta: unavailable"),
+            },
             _ => println!("Measured statvfs free-space delta: unavailable"),
         }
     }
@@ -776,8 +793,20 @@ fn render_summary(
     }
 }
 
+/// Signed SI label for a measured free-space change; `None` when the change does not fit `u64`.
+fn free_space_delta(before: u128, after: u128) -> Option<String> {
+    let (sign, change) = if after >= before {
+        ('+', after - before)
+    } else {
+        ('-', before - after)
+    };
+    u64::try_from(change)
+        .ok()
+        .map(|bytes| format!("{sign}{}", bytes_si(bytes)))
+}
+
 fn format_size(size: Option<u64>) -> String {
-    size.map_or_else(|| "unknown".to_owned(), |bytes| format!("{bytes} bytes"))
+    size.map_or_else(|| "unknown".to_owned(), bytes_si)
 }
 
 /// Display form of a path: UTF-8 is kept, controls and invalid bytes are escaped.

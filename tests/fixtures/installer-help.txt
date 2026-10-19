@@ -1,0 +1,11 @@
+Find installer files
+
+Usage: mole-linux installer [OPTIONS]
+
+Options:
+      --debug                  Enable debug output
+      --dry-run                List installer files and change nothing
+      --max-depth <MAX_DEPTH>  Directory depth to scan, 1-16 (default 2)
+      --hidden                 Also scan hidden (dot) directories
+      --type <TYPE>            List only one installer type: deb, rpm, appimage, pkg.tar.zst, iso, tar, zip, flatpakref
+  -h, --help                   Print help

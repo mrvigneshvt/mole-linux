@@ -54,3 +54,50 @@ pub fn is_process_running(proc_root: &Path, pid: u32) -> ProcessState {
         ProcessState::Running
     }
 }
+
+/// Finds a process by its procfs `comm` name without treating unreadable entries as absence.
+pub fn is_process_name_running(proc_root: &Path, expected: &str) -> ProcessState {
+    let entries = match fs::read_dir(proc_root) {
+        Ok(entries) => entries,
+        Err(_) => return ProcessState::Unknown,
+    };
+    let mut unknown = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                unknown = true;
+                continue;
+            }
+        };
+        if entry
+            .file_name()
+            .to_str()
+            .is_none_or(|name| !name.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        let comm_path = entry.path().join("comm");
+        let mut comm = String::new();
+        let file = match fs::File::open(comm_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                unknown = true;
+                continue;
+            }
+        };
+        if file.take(4097).read_to_string(&mut comm).is_err() || comm.len() > 4096 {
+            unknown = true;
+            continue;
+        }
+        if comm.trim_end_matches(['\r', '\n']) == expected {
+            return ProcessState::Running;
+        }
+    }
+    if unknown {
+        ProcessState::Unknown
+    } else {
+        ProcessState::NotRunning
+    }
+}

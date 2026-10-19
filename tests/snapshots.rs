@@ -1,6 +1,9 @@
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use tempfile::tempdir;
+#[path = "support/home.rs"]
+mod home_support;
+use home_support::CommandHomeExt;
 
 fn install_shim(bin: &std::path::Path, name: &str, script: &str) {
     let path = bin.join(name);
@@ -13,9 +16,11 @@ fn install_shim(bin: &std::path::Path, name: &str, script: &str) {
 }
 
 fn run_with_path(path: &std::path::Path) -> std::process::Output {
+    let home = tempdir().expect("temporary HOME");
     Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .arg("snapshots")
         .env("PATH", path)
+        .isolated_home(home.path())
         .output()
         .expect("run snapshots")
 }

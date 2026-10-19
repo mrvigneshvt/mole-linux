@@ -3,6 +3,9 @@ use std::process::Command;
 use tempfile::tempdir;
 
 use mole_linux::scan::{self, OverviewRoots};
+#[path = "support/home.rs"]
+mod home_support;
+use home_support::CommandHomeExt;
 
 #[test]
 fn pathless_analyze_json_measures_injected_overview_roots_and_keeps_missing_unavailable() {
@@ -18,7 +21,7 @@ fn pathless_analyze_json_measures_injected_overview_roots_and_keeps_missing_unav
 
     let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["analyze", "--json"])
-        .env("HOME", home.path())
+        .isolated_home(home.path())
         .env("XDG_CACHE_HOME", &cache)
         .env("XDG_DATA_HOME", &data)
         .env("XDG_STATE_HOME", &state)

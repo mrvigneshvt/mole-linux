@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use mole_linux::core::outcome::{Outcome, OutcomeLedger};
-use mole_linux::core::proc::{ProcessState, is_process_running};
+use mole_linux::core::proc::{ProcessState, is_process_name_running, is_process_running};
 
 #[test]
 fn destructive_filesystem_calls_are_confined_to_the_sink() {
@@ -96,6 +96,33 @@ fn process_probe_reads_the_host_procfs_for_a_live_process() {
     assert_eq!(
         is_process_running(Path::new("/proc"), pid),
         ProcessState::Running
+    );
+}
+
+#[test]
+fn process_name_probe_distinguishes_running_absent_and_unreadable() {
+    let temp = tempfile::tempdir().expect("temporary proc root");
+    let proc_root = temp.path().join("proc");
+    let process = proc_root.join("123");
+    fs::create_dir_all(&process).expect("process dir");
+    fs::write(process.join("comm"), "owner-worker\n").expect("comm");
+    assert_eq!(
+        is_process_name_running(&proc_root, "owner-worker"),
+        ProcessState::Running
+    );
+    assert_eq!(
+        is_process_name_running(&proc_root, "absent-worker"),
+        ProcessState::NotRunning
+    );
+    assert_eq!(
+        is_process_name_running(&temp.path().join("missing"), "owner-worker"),
+        ProcessState::Unknown
+    );
+    fs::create_dir(proc_root.join("456")).expect("unreadable process fixture");
+    fs::write(proc_root.join("456/comm"), "x".repeat(5000)).expect("oversized comm");
+    assert_eq!(
+        is_process_name_running(&proc_root, "absent-worker"),
+        ProcessState::Unknown
     );
 }
 

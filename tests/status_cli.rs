@@ -1,11 +1,11 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+#[path = "support/home.rs"]
+mod home_support;
+use home_support::CommandHomeExt;
 
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_mole-linux"))
-        .args(args)
-        .output()
-        .expect("run mole-linux")
+    home_support::output(args)
 }
 
 #[test]
@@ -25,8 +25,10 @@ fn status_piped_stdout_emits_json_without_flag() {
 
 #[test]
 fn status_watch_emits_one_json_snapshot_per_line() {
+    let home = tempfile::tempdir().expect("temporary HOME");
     let mut child = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["status", "--watch", "--interval", "1s"])
+        .isolated_home(home.path())
         .stdout(Stdio::piped())
         .spawn()
         .expect("run status watch");
@@ -65,8 +67,10 @@ fn status_watch_rejects_zero_interval() {
 
 #[test]
 fn status_watch_exits_cleanly_when_stdout_closes() {
+    let home = tempfile::tempdir().expect("temporary HOME");
     let mut child = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["status", "--watch", "--interval", "10ms"])
+        .isolated_home(home.path())
         .stdout(Stdio::piped())
         .spawn()
         .expect("run status watch");

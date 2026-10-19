@@ -1,0 +1,517 @@
+use std::collections::BTreeSet;
+use std::io::{self, IsTerminal, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::SystemTime;
+
+use rustix::fs::statvfs;
+
+use crate::core::oplog::{OpLog, Session, SessionSummary};
+use crate::core::paths::XdgPaths;
+use crate::core::proc::{self, ProcessState};
+use crate::core::sink::{DeleteMode, SinkContext, delete};
+use crate::core::validate::validate_path_for_deletion;
+use crate::core::whitelist::Whitelist;
+use crate::rules::clean::{Candidate, Category, CleanRule, DiscoveryStatus, RuleContext, catalog};
+
+static CANCEL_SIGNAL: AtomicI32 = AtomicI32::new(0);
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Default)]
+pub struct CleanArgs {
+    pub dry_run: bool,
+    pub yes: bool,
+    pub categories: Option<String>,
+    pub select: Option<String>,
+    pub exclude: Option<String>,
+    pub external: bool,
+    pub whitelist: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanSummary {
+    pub discovered: u64,
+    pub applied: u64,
+    pub unchanged: u64,
+    pub skipped: u64,
+    pub unavailable: u64,
+    pub attention: u64,
+    pub failed: u64,
+    pub protected: u64,
+    pub allocated_applied: Option<u64>,
+    pub cancelled: bool,
+}
+
+impl Default for CleanSummary {
+    fn default() -> Self {
+        Self {
+            discovered: 0,
+            applied: 0,
+            unchanged: 0,
+            skipped: 0,
+            unavailable: 0,
+            attention: 0,
+            failed: 0,
+            protected: 0,
+            allocated_applied: Some(0),
+            cancelled: false,
+        }
+    }
+}
+
+pub fn run(args: CleanArgs) -> io::Result<()> {
+    let xdg = XdgPaths::from_env()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set or invalid"))?;
+    if args.whitelist {
+        println!("Whitelist: {}", display_path(&Whitelist::path(&xdg)));
+        return Ok(());
+    }
+    if args.external {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "external targets are not registered by the Linux clean catalog",
+        ));
+    }
+    let whitelist = Whitelist::load(&xdg)
+        .map_err(|error| io::Error::other(format!("failed to load whitelist: {error:?}")))?;
+    for warning in &whitelist.warnings {
+        eprintln!(
+            "mole-linux: whitelist line {} ignored: {}",
+            warning.line, warning.reason
+        );
+    }
+    let process_probe = |name: &str| proc::is_process_name_running(Path::new("/proc"), name);
+    CANCEL_SIGNAL.store(0, Ordering::Relaxed);
+    CANCELLED.store(false, Ordering::Relaxed);
+    install_signal_handlers()?;
+    let context = RuleContext {
+        home: &xdg.home,
+        xdg: &xdg,
+        whitelist: &whitelist,
+        proc_probe: &process_probe,
+        now: SystemTime::now(),
+        cancel: &CANCELLED,
+    };
+    let rules = catalog();
+    let rule_refs: Vec<&dyn CleanRule> = rules.iter().map(Box::as_ref).collect();
+    let sink = SinkContext::new(xdg.clone(), whitelist.clone());
+    let before = available_bytes(&xdg.home);
+    let mut session = OpLog::new()?.start_session("clean", args.dry_run)?;
+    let result = execute_rules(&args, &rule_refs, &context, &sink, &mut session);
+    let after = available_bytes(&xdg.home);
+    let mut summary = match result {
+        Ok(summary) => summary,
+        Err(error) => {
+            let empty = CleanSummary::default();
+            session.end(&session_summary(&empty))?;
+            return Err(error);
+        }
+    };
+    summary.cancelled |= CANCEL_SIGNAL.load(Ordering::Relaxed) != 0;
+    session.end(&session_summary(&summary))?;
+    render_summary(args.dry_run, &summary, before, after);
+    if summary.cancelled {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "clean interrupted",
+        ));
+    }
+    Ok(())
+}
+
+/// Discovers, previews, validates, confirms, and sends eligible items through the sink.
+pub fn execute_rules(
+    args: &CleanArgs,
+    rules: &[&dyn CleanRule],
+    context: &RuleContext<'_>,
+    sink: &SinkContext,
+    session: &mut Session,
+) -> io::Result<CleanSummary> {
+    let categories = parse_filter(args.categories.as_deref());
+    let selected = parse_filter(args.select.as_deref());
+    let excluded = parse_filter(args.exclude.as_deref());
+    let known = rules
+        .iter()
+        .flat_map(|rule| [rule.id().to_owned(), rule.category().as_str().to_owned()])
+        .collect::<BTreeSet<_>>();
+    for value in categories
+        .iter()
+        .chain(selected.iter())
+        .chain(excluded.iter())
+    {
+        if !known.is_empty() && !known.contains(value) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown clean rule or category: {value}"),
+            ));
+        }
+    }
+
+    let mut summary = CleanSummary::default();
+    let mut candidates: Vec<(String, Candidate)> = Vec::new();
+    for rule in rules {
+        if context.cancel.load(Ordering::Relaxed) {
+            summary.cancelled = true;
+            break;
+        }
+        let id = rule.id();
+        let category = rule.category();
+        if excluded.contains(id) || excluded.contains(category.as_str()) {
+            continue;
+        }
+        if !categories.is_empty() && !categories.contains(category.as_str()) {
+            continue;
+        }
+        if !selected.is_empty() && !selected.contains(id) && !selected.contains(category.as_str()) {
+            continue;
+        }
+        let discovery = rule.discover(context);
+        match &discovery.status {
+            DiscoveryStatus::Complete => {}
+            DiscoveryStatus::Partial(reason) => println!(
+                "{}: partial discovery ({})",
+                category.as_str(),
+                escape_text(reason)
+            ),
+            DiscoveryStatus::Unavailable(reason) => {
+                println!(
+                    "{}: unavailable ({})",
+                    category.as_str(),
+                    escape_text(reason)
+                );
+                record_outcome(&mut summary, "unavailable");
+                continue;
+            }
+        }
+        for candidate in discovery.candidates {
+            candidates.push((id.to_owned(), candidate));
+        }
+    }
+    deduplicate_candidates(&mut candidates);
+    summary.discovered = u64::try_from(candidates.len())
+        .map_err(|_| io::Error::other("candidate count does not fit summary"))?;
+
+    let mut apply = Vec::new();
+    for (rule_id, mut candidate) in candidates {
+        if context.cancel.load(Ordering::Relaxed) {
+            summary.cancelled = true;
+            record(&mut summary, session, "skipped", &candidate.path)?;
+            continue;
+        }
+        if let Some(reason) = protected_reason(&candidate, context) {
+            summary.protected = summary.protected.saturating_add(1);
+            summary.skipped = summary.skipped.saturating_add(1);
+            println!(
+                "Protected: {} ({})",
+                display_path(&candidate.path),
+                escape_text(&reason)
+            );
+            record(&mut summary, session, "skipped", &candidate.path)?;
+            continue;
+        }
+        if candidate.owner_state != ProcessState::NotRunning {
+            candidate.selected_by_default = false;
+            let (outcome, state_reason) = match candidate.owner_state {
+                ProcessState::Running => ("skipped", "owner process is running"),
+                ProcessState::Unknown => ("unavailable", "owner process state is unknown"),
+                ProcessState::NotRunning => unreachable!(),
+            };
+            record(&mut summary, session, outcome, &candidate.path)?;
+            println!(
+                "{}: {} ({})",
+                display_path(&candidate.path),
+                escape_text(&candidate.reason),
+                state_reason
+            );
+            continue;
+        }
+        let explicitly_selected = selected.contains(&rule_id)
+            || selected.contains(candidate.path.to_string_lossy().as_ref());
+        let selected_for_action = candidate.selected_by_default || explicitly_selected;
+        println!(
+            "{} [{}] {} · {} · logical={} · allocated={}",
+            if selected_for_action {
+                "Selected"
+            } else {
+                "Not selected"
+            },
+            category_for_rule(rules, &rule_id).as_str(),
+            display_path(&candidate.path),
+            escape_text(&candidate.reason),
+            format_size(candidate.apparent_size),
+            format_size(candidate.allocated_size)
+        );
+        if selected_for_action {
+            apply.push((rule_id, candidate));
+        } else if args.dry_run {
+            record(&mut summary, session, "unchanged", &candidate.path)?;
+        } else {
+            record(&mut summary, session, "skipped", &candidate.path)?;
+        }
+    }
+
+    if !args.dry_run && !apply.is_empty() && !args.yes && !confirm()? {
+        summary.cancelled = true;
+        for (_, candidate) in apply {
+            record(&mut summary, session, "skipped", &candidate.path)?;
+        }
+        return Ok(summary);
+    }
+
+    if args.dry_run {
+        for (_, candidate) in apply {
+            record(&mut summary, session, "unchanged", &candidate.path)?;
+        }
+    } else {
+        let mut sized_objects = BTreeSet::new();
+        for (_, candidate) in apply {
+            if context.cancel.load(Ordering::Relaxed) {
+                summary.cancelled = true;
+                record(&mut summary, session, "skipped", &candidate.path)?;
+                continue;
+            }
+            let owner_state = context.check_owner(&candidate.owner_check);
+            if owner_state != ProcessState::NotRunning {
+                let (outcome, reason) = match owner_state {
+                    ProcessState::Running => ("skipped", "owner process is running"),
+                    ProcessState::Unknown => ("unavailable", "owner process state is unknown"),
+                    ProcessState::NotRunning => unreachable!(),
+                };
+                record(&mut summary, session, outcome, &candidate.path)?;
+                println!("{}: {}", display_path(&candidate.path), reason);
+                continue;
+            }
+            let mode = match candidate.recovery {
+                crate::rules::clean::RecoveryMode::OwnerNative => {
+                    record(&mut summary, session, "unavailable", &candidate.path)?;
+                    println!(
+                        "Unavailable: {} (owner-native action not registered)",
+                        display_path(&candidate.path)
+                    );
+                    continue;
+                }
+                crate::rules::clean::RecoveryMode::Irreversible => DeleteMode::Permanent,
+                crate::rules::clean::RecoveryMode::Regenerate
+                | crate::rules::clean::RecoveryMode::Trash => DeleteMode::Trash,
+            };
+            match delete(&candidate.path, &candidate.identity, mode, sink) {
+                Ok(_) => {
+                    record_outcome(&mut summary, "applied");
+                    if sized_objects.insert(candidate.identity.object_key()) {
+                        summary.allocated_applied =
+                            match (summary.allocated_applied, candidate.allocated_size) {
+                                (Some(total), Some(size)) => total.checked_add(size),
+                                _ => None,
+                            };
+                    }
+                    session.record("CLEAN", "applied", &candidate.path)?;
+                }
+                Err(error) => {
+                    record_outcome(&mut summary, "failed");
+                    println!(
+                        "Failed: {} ({})",
+                        display_path(&candidate.path),
+                        escape_text(&error.to_string())
+                    );
+                    session.record("CLEAN", "failed", &candidate.path)?;
+                }
+            }
+        }
+    }
+    Ok(summary)
+}
+
+fn protected_reason(candidate: &Candidate, context: &RuleContext<'_>) -> Option<String> {
+    if context.whitelist.matches(&candidate.path)
+        || candidate
+            .path
+            .canonicalize()
+            .ok()
+            .is_some_and(|resolved| context.whitelist.matches(&resolved))
+    {
+        return Some("whitelist".to_owned());
+    }
+    validate_path_for_deletion(&candidate.path, context.home, context.xdg)
+        .err()
+        .map(|error| format!("policy: {error:?}"))
+}
+
+fn deduplicate_candidates(candidates: &mut Vec<(String, Candidate)>) {
+    candidates.sort_by_key(|(_, candidate)| candidate.path.components().count());
+    let mut accepted: Vec<(String, Candidate)> = Vec::new();
+    for entry in candidates.drain(..) {
+        if accepted
+            .iter()
+            .any(|(_, existing)| entry.1.path.starts_with(&existing.path))
+        {
+            continue;
+        }
+        accepted.push(entry);
+    }
+    *candidates = accepted;
+}
+
+fn category_for_rule(rules: &[&dyn CleanRule], id: &str) -> Category {
+    rules
+        .iter()
+        .find(|rule| rule.id() == id)
+        .map_or(Category::User, |rule| rule.category())
+}
+
+fn parse_filter(value: Option<&str>) -> BTreeSet<String> {
+    value
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn confirm() -> io::Result<bool> {
+    if !io::stdin().is_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "clean apply requires a terminal confirmation or --yes",
+        ));
+    }
+    print!("Apply cleanup to the selected items? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+fn record_outcome(summary: &mut CleanSummary, outcome: &str) {
+    let counter = match outcome {
+        "applied" => &mut summary.applied,
+        "unchanged" => &mut summary.unchanged,
+        "skipped" => &mut summary.skipped,
+        "unavailable" => &mut summary.unavailable,
+        "attention" => &mut summary.attention,
+        _ => &mut summary.failed,
+    };
+    *counter = counter.saturating_add(1);
+}
+
+fn record(
+    summary: &mut CleanSummary,
+    session: &mut Session,
+    outcome: &str,
+    path: &Path,
+) -> io::Result<()> {
+    record_outcome(summary, outcome);
+    session.record("CLEAN", outcome, path)
+}
+
+fn session_summary(summary: &CleanSummary) -> SessionSummary {
+    SessionSummary {
+        items: summary.applied,
+        size: summary
+            .allocated_applied
+            .map_or_else(|| "unknown".to_owned(), |size| format!("{size}B")),
+    }
+}
+
+fn available_bytes(path: &Path) -> io::Result<u128> {
+    let stats = statvfs(path).map_err(io::Error::from)?;
+    Ok(u128::from(stats.f_bavail) * u128::from(stats.f_frsize))
+}
+
+fn render_summary(
+    dry_run: bool,
+    summary: &CleanSummary,
+    before: io::Result<u128>,
+    after: io::Result<u128>,
+) {
+    println!(
+        "{}",
+        if dry_run {
+            "Clean preview complete"
+        } else {
+            "Clean complete"
+        }
+    );
+    println!(
+        "Discovered: {} · applied: {} · unchanged: {} · skipped: {} · unavailable: {} · attention: {} · failed: {}",
+        summary.discovered,
+        summary.applied,
+        summary.unchanged,
+        summary.skipped,
+        summary.unavailable,
+        summary.attention,
+        summary.failed
+    );
+    println!(
+        "Summed allocated size of applied items: {}",
+        format_size(summary.allocated_applied)
+    );
+    match (before, after) {
+        (Ok(before), Ok(after)) if after >= before => println!(
+            "Measured statvfs free-space delta: +{} bytes",
+            after - before
+        ),
+        (Ok(before), Ok(after)) => println!(
+            "Measured statvfs free-space delta: -{} bytes",
+            before - after
+        ),
+        _ => println!("Measured statvfs free-space delta: unavailable"),
+    }
+    if summary.cancelled {
+        println!("Cleanup cancelled; remaining items were skipped");
+    }
+}
+
+fn format_size(size: Option<u64>) -> String {
+    size.map_or_else(|| "unknown".to_owned(), |bytes| format!("{bytes} bytes"))
+}
+
+fn display_path(path: &Path) -> String {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(|byte| {
+            if *byte < 0x20 || *byte == 0x7f {
+                format!("\\x{byte:02x}")
+            } else {
+                char::from(*byte).to_string()
+            }
+        })
+        .collect()
+}
+
+fn escape_text(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
+}
+
+fn install_signal_handlers() -> io::Result<()> {
+    unsafe extern "C" {
+        fn signal(signal: i32, handler: usize) -> usize;
+    }
+    extern "C" fn mark_cancelled(signal_number: i32) {
+        CANCELLED.store(true, Ordering::Relaxed);
+        CANCEL_SIGNAL.store(signal_number, Ordering::Relaxed);
+    }
+    // SAFETY: the handler only writes to an atomic integer and remains valid for the process lifetime.
+    let previous = unsafe { signal(2, mark_cancelled as *const () as usize) };
+    if previous == usize::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comma_filter_trims_and_ignores_empty_parts() {
+        assert_eq!(
+            parse_filter(Some(" a, ,b ")),
+            BTreeSet::from(["a".to_owned(), "b".to_owned()])
+        );
+    }
+}

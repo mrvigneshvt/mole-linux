@@ -11,6 +11,10 @@ if ! git rebase -q origin/main; then
   done
   GIT_EDITOR=true git rebase --continue
 fi
+cargo fmt --all
+if ! git diff --quiet; then git commit -qam "style: cargo fmt after rebase
+
+Agent-Context: n/a — formatting"; fi
 "$(dirname "$(readlink -f "$0")")/gate.sh" "$PWD" > target/gate-summary.txt 2>&1 || true
 if ! grep -q "GATE_RC=0" target/gate-summary.txt; then cat target/gate-summary.txt; echo "GATE FAILED — not merging"; exit 4; fi
 git push -qf origin HEAD

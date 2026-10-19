@@ -1,4 +1,5 @@
 pub mod fsutil;
+pub mod oplog;
 pub mod outcome;
 pub mod paths;
 pub mod proc;

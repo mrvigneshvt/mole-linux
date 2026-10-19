@@ -67,5 +67,5 @@ jobs:
               # mole-linux refuses to run as root by design; test as an unprivileged user.
               useradd --create-home ci
               chown -R ci:ci /workspace
-              sudo -u ci -H bash -euc "cd /workspace && cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test"
+              sudo -u ci -H bash -euc "cd /workspace && cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && RUST_TEST_THREADS=1 cargo test"
             '

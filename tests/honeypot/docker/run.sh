@@ -25,7 +25,21 @@ if [[ ! -x "$binary" ]]; then
 fi
 
 docker build --file "$dockerfile_dir/Dockerfile" --tag "$image" "$build_context"
-docker run --rm \
+docker_args=(--rm)
+if [[ "$scenario" == analyze-delete ]]; then
+    test_binary=
+    for candidate in "$repo_root"/target/debug/deps/analyze_delete-*; do
+        if [[ -x "$candidate" ]]; then
+            test_binary=$candidate
+        fi
+    done
+    if [[ -z "$test_binary" ]]; then
+        printf 'missing analyze-delete integration test binary; run cargo test --test analyze_delete first\n' >&2
+        exit 1
+    fi
+    docker_args+=(--cap-add SYS_ADMIN --mount "type=bind,src=$test_binary,dst=/usr/local/bin/analyze-delete-tests,readonly")
+fi
+docker run "${docker_args[@]}" \
     --mount "type=bind,src=$binary,dst=/usr/local/bin/mole-linux,readonly" \
     --mount "type=bind,src=$scenario_file,dst=/tmp/honeypot-scenario.sh,readonly" \
     --mount "type=bind,src=$package_dir,dst=/tmp/mole-linux-packaging-input,readonly" \

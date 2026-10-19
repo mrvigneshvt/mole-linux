@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
@@ -128,4 +129,43 @@ fn browser_running_or_unknown_keeps_cache_and_unknown_is_reported() {
         assert_eq!(report.skipped, expected_skipped);
         assert!(target.join("payload").exists());
     }
+}
+
+#[test]
+fn browser_runner_prints_measured_sizes_even_when_owner_state_skips_cleanup() {
+    let temp = tempfile::tempdir().expect("temporary root");
+    let home = temp.path().join("home");
+    let cache = home.join(".cache/chromium");
+    fs::create_dir_all(cache.join("Default/Cache")).expect("create browser cache");
+    fs::write(
+        cache.join("Default/Cache/payload"),
+        vec![7_u8; 8 * 1024 * 1024],
+    )
+    .expect("seed browser cache");
+    let expected = mole_linux::scan::scan(&cache, &AtomicBool::new(false)).root;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
+        .args(["clean", "--dry-run", "--select", "browser-cache"])
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .output()
+        .expect("run browser cache preview");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let row = stdout
+        .lines()
+        .find(|line| line.contains(".cache/chromium"))
+        .expect("Chromium candidate row");
+    assert!(
+        row.contains(&format!("logical={} bytes", expected.apparent)),
+        "{row}"
+    );
+    assert!(
+        row.contains(&format!("allocated={} bytes", expected.allocated)),
+        "{row}"
+    );
 }

@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::time::SystemTime;
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use rustix::fs::statvfs;
 
@@ -13,9 +15,11 @@ use crate::core::sink::{DeleteMode, SinkContext, delete};
 use crate::core::validate::validate_path_for_deletion;
 use crate::core::whitelist::Whitelist;
 use crate::rules::clean::{Candidate, Category, CleanRule, DiscoveryStatus, RuleContext, catalog};
+use crate::scan::{self, Node, NodeStatus};
 
 static CANCEL_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static CANCELLED: AtomicBool = AtomicBool::new(false);
+const SIZE_SCAN_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Default)]
 pub struct CleanArgs {
@@ -190,6 +194,7 @@ pub fn execute_rules(
     deduplicate_candidates(&mut candidates);
     summary.discovered = u64::try_from(candidates.len())
         .map_err(|_| io::Error::other("candidate count does not fit summary"))?;
+    let size_scan_deadline = Instant::now() + SIZE_SCAN_BUDGET;
 
     let mut apply = Vec::new();
     for (rule_id, mut candidate) in candidates {
@@ -209,6 +214,14 @@ pub fn execute_rules(
             record(&mut summary, session, "skipped", &candidate.path)?;
             continue;
         }
+        if candidate.apparent_size.is_none() || candidate.allocated_size.is_none() {
+            measure_candidate_size(&mut candidate, size_scan_deadline, context.cancel);
+        }
+        if context.cancel.load(Ordering::Relaxed) {
+            summary.cancelled = true;
+            record(&mut summary, session, "skipped", &candidate.path)?;
+            continue;
+        }
         if candidate.owner_state != ProcessState::NotRunning {
             candidate.selected_by_default = false;
             let (outcome, state_reason) = match candidate.owner_state {
@@ -218,10 +231,12 @@ pub fn execute_rules(
             };
             record(&mut summary, session, outcome, &candidate.path)?;
             println!(
-                "{}: {} ({})",
+                "{}: {} ({}) · logical={} · allocated={}",
                 display_path(&candidate.path),
                 escape_text(&candidate.reason),
-                state_reason
+                state_reason,
+                format_size(candidate.apparent_size),
+                format_size(candidate.allocated_size)
             );
             continue;
         }
@@ -334,6 +349,103 @@ fn protected_reason(candidate: &Candidate, context: &RuleContext<'_>) -> Option<
     validate_path_for_deletion(&candidate.path, context.home, context.xdg)
         .err()
         .map(|error| format!("policy: {error:?}"))
+}
+
+fn measure_candidate_size(candidate: &mut Candidate, deadline: Instant, cancel: &AtomicBool) {
+    match scan_candidate(&candidate.path, deadline, cancel) {
+        Ok((apparent, allocated)) => {
+            candidate.apparent_size.get_or_insert(apparent);
+            candidate.allocated_size.get_or_insert(allocated);
+        }
+        Err(reason) => {
+            candidate.reason.push_str("; size unavailable: ");
+            candidate.reason.push_str(&reason);
+        }
+    }
+}
+
+fn scan_candidate(
+    path: &Path,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<(u64, u64), String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("scan cancelled".to_owned());
+    }
+    if Instant::now() >= deadline {
+        return Err("per-run size scan deadline exceeded".to_owned());
+    }
+
+    let scan_cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&scan_cancel);
+    let scan_path = path.to_path_buf();
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("clean-size-scan".to_owned())
+        .spawn(move || {
+            let report = scan::scan(&scan_path, &worker_cancel);
+            if sender.send(report).is_err() {
+                worker_cancel.store(true, Ordering::Relaxed);
+            }
+        })
+        .map_err(|error| format!("could not start size scan: {error}"))?;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            scan_cancel.store(true, Ordering::Relaxed);
+            return Err("scan cancelled".to_owned());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            scan_cancel.store(true, Ordering::Relaxed);
+            return Err("per-run size scan deadline exceeded".to_owned());
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            Ok(report) => {
+                if Instant::now() >= deadline {
+                    scan_cancel.store(true, Ordering::Relaxed);
+                    return Err("per-run size scan deadline exceeded".to_owned());
+                }
+                match report.root.status {
+                    NodeStatus::Complete => {
+                        return Ok((report.root.apparent, report.root.allocated));
+                    }
+                    NodeStatus::Unavailable(reason) => {
+                        return Err(format!("scan unavailable: {reason}"));
+                    }
+                    NodeStatus::Partial => {
+                        return Err(incomplete_scan_reason(&report.root, deadline));
+                    }
+                    NodeStatus::Excluded(reason) => {
+                        return Err(format!("scan excluded: {reason}"));
+                    }
+                    NodeStatus::Scanning => {
+                        return Err("scan did not complete".to_owned());
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("size scan worker stopped without a result".to_owned());
+            }
+        }
+    }
+}
+
+fn incomplete_scan_reason(root: &Node, deadline: Instant) -> String {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if Instant::now() >= deadline {
+            return "per-run size scan deadline exceeded".to_owned();
+        }
+        match &node.status {
+            NodeStatus::Unavailable(reason) => {
+                return format!("scan incomplete: {reason}");
+            }
+            _ => pending.extend(node.children.iter()),
+        }
+    }
+    "scan incomplete; an entry could not be read or permission was denied".to_owned()
 }
 
 fn deduplicate_candidates(candidates: &mut Vec<(String, Candidate)>) {
@@ -508,6 +620,7 @@ fn install_signal_handlers() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn comma_filter_trims_and_ignores_empty_parts() {
@@ -515,5 +628,57 @@ mod tests {
             parse_filter(Some(" a, ,b ")),
             BTreeSet::from(["a".to_owned(), "b".to_owned()])
         );
+    }
+
+    #[test]
+    fn expired_size_scan_deadline_leaves_sizes_unknown_with_a_reason() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("cache");
+        std::fs::create_dir(&path).expect("create cache");
+        let mut candidate = crate::rules::clean::candidate(
+            &path,
+            "test cache",
+            crate::rules::clean::RecoveryMode::Regenerate,
+            ProcessState::NotRunning,
+        )
+        .expect("capture cache");
+
+        measure_candidate_size(
+            &mut candidate,
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("past instant"),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(candidate.apparent_size, None);
+        assert_eq!(candidate.allocated_size, None);
+        assert!(candidate.reason.contains("size unavailable"));
+        assert!(candidate.reason.contains("deadline exceeded"));
+    }
+
+    #[test]
+    fn unavailable_size_scan_leaves_sizes_unknown_with_scan_error() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("missing-cache");
+        let mut candidate = crate::rules::clean::candidate(
+            temp.path(),
+            "test cache",
+            crate::rules::clean::RecoveryMode::Regenerate,
+            ProcessState::NotRunning,
+        )
+        .expect("capture cache");
+        candidate.path = path;
+
+        measure_candidate_size(
+            &mut candidate,
+            Instant::now() + Duration::from_secs(1),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(candidate.apparent_size, None);
+        assert_eq!(candidate.allocated_size, None);
+        assert!(candidate.reason.contains("size unavailable"));
+        assert!(candidate.reason.contains("scan unavailable"));
     }
 }

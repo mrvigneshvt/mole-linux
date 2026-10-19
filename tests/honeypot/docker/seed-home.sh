@@ -4,7 +4,7 @@ home=${1:?usage: seed-home.sh HOME}
 manifest=/usr/local/share/mole-honeypot/manifest.tsv
 repository=
 linked_worktree=
-tracked_file=
+tracked_files=()
 while IFS=$'\t' read -r kind relative; do
     [[ -n "$kind" && "$kind" != \#* ]] || continue
     path="$home/$relative"
@@ -12,7 +12,7 @@ while IFS=$'\t' read -r kind relative; do
         dir) mkdir -p "$path" ;;
         git-repo) repository="$relative" ;;
         git-track)
-            tracked_file="$relative"
+            tracked_files+=("$relative")
             mkdir -p "$(dirname "$path")"
             printf 'fn main() { println!("fixture project"); }\n' > "$path"
             ;;
@@ -37,11 +37,12 @@ while IFS=$'\t' read -r kind relative; do
     esac
 done < "$manifest"
 export HOME="$home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
-tracked_relative=${tracked_file#"$repository"/}
 git -c init.defaultBranch=main init "$home/$repository"
 git -C "$home/$repository" config user.name 'Honeypot Fixture'
 git -C "$home/$repository" config user.email honeypot@example.invalid
-git -C "$home/$repository" add "$tracked_relative"
+for tracked_file in "${tracked_files[@]}"; do
+    git -C "$home/$repository" add "${tracked_file#"$repository"/}"
+done
 git -C "$home/$repository" commit -m 'seed honeypot project'
 git -C "$home/$repository" worktree add -b linked "$home/$linked_worktree"
 checksum_file="$home/canary.sha256"

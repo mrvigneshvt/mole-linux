@@ -55,6 +55,10 @@ const GIT_BUDGET: Duration = Duration::from_secs(5);
 
 pub struct PyCacheRule;
 
+pub fn registered() -> Box<dyn CleanRule> {
+    Box::new(PyCacheRule)
+}
+
 impl CleanRule for PyCacheRule {
     fn id(&self) -> &str {
         RULE_ID

@@ -194,17 +194,25 @@ fn is_canary(kind: EntryKind) -> bool {
 
 fn initialize_git_fixture(root: &Path, entries: &[(EntryKind, String)]) -> io::Result<()> {
     let repository = entry_path(entries, EntryKind::GitRepository)?;
-    let tracked_file = entry_path(entries, EntryKind::GitTrack)?;
+    let tracked_files = entries
+        .iter()
+        .filter(|(kind, _)| *kind == EntryKind::GitTrack)
+        .map(|(_, path)| path.as_str())
+        .collect::<Vec<_>>();
     let worktree = entry_path(entries, EntryKind::Worktree)?;
     let repository_path = Path::new(repository);
-    let tracked_relative = Path::new(tracked_file)
-        .strip_prefix(repository_path)
-        .map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "git track file is outside repo")
-        })?;
-    let tracked_relative = tracked_relative
-        .to_str()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 tracked path"))?;
+    let mut tracked_relatives = Vec::new();
+    for tracked_file in tracked_files {
+        let tracked_relative = Path::new(tracked_file)
+            .strip_prefix(repository_path)
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "git track file is outside repo")
+            })?;
+        let tracked_relative = tracked_relative
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 tracked path"))?;
+        tracked_relatives.push(tracked_relative.to_owned());
+    }
 
     run_git(root, &["-c", "init.defaultBranch=main", "init", repository])?;
     run_git(
@@ -221,7 +229,9 @@ fn initialize_git_fixture(root: &Path, entries: &[(EntryKind, String)]) -> io::R
             "honeypot@example.invalid",
         ],
     )?;
-    run_git(root, &["-C", repository, "add", tracked_relative])?;
+    for tracked_relative in &tracked_relatives {
+        run_git(root, &["-C", repository, "add", tracked_relative])?;
+    }
     run_git(
         root,
         &["-C", repository, "commit", "-m", "seed honeypot project"],

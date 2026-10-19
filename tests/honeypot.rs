@@ -216,3 +216,37 @@ fn clean_browser_apply_removes_only_browser_caches_and_keeps_every_canary() {
         .assert_canaries_intact()
         .expect("canaries intact after browser cache cleanup");
 }
+
+#[test]
+fn clean_pycache_dryrun_keeps_tracked_nested_and_every_canary() {
+    run_pycache_scenario("clean-pycache-dryrun.sh");
+}
+
+#[test]
+fn clean_pycache_apply_removes_only_untracked_pycache_and_keeps_every_canary() {
+    run_pycache_scenario("clean-pycache-apply.sh");
+}
+
+fn run_pycache_scenario(name: &str) {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let home = temp.path().join("home");
+    let fixture = fixtures::HomeFixture::build(&home).expect("build honeypot");
+    let scenario = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/honeypot/scenarios")
+        .join(name);
+    let output = Command::new("bash")
+        .arg(scenario)
+        .arg(env!("CARGO_BIN_EXE_mole-linux"))
+        .isolated_home(&home)
+        .output()
+        .expect("run pycache scenario");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fixture
+        .assert_canaries_intact()
+        .expect("canaries intact after pycache scenario");
+}

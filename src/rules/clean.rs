@@ -136,5 +136,8 @@ pub fn candidate(
 
 /// Concrete Linux cleanup targets are registered by M4.2 and later units.
 pub fn catalog() -> Vec<Box<dyn CleanRule>> {
-    vec![super::browser::registered()]
+    vec![
+        super::browser::registered(),
+        super::project_cache::registered(),
+    ]
 }

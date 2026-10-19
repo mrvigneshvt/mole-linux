@@ -34,6 +34,10 @@ dir	project
 dir	project/src
 dir	project/node_modules/authored-package
 dir	project/src/__pycache__
+git-track	project/src/__pycache__/tracked.pyc
+target-file	project/pkg/__pycache__/mole-linux-pycache-fixture.pyc
+target-file	project/nested-cache/__pycache__/mole-linux-pycache-fixture.pyc
+canary	project/nested-cache/__pycache__/vendored/.git/HEAD
 dir	cargo-project
 dir	cargo-project/target
 git-repo	project

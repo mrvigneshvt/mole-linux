@@ -21,6 +21,16 @@ use mole_linux::rules::clean::{
 use mole_linux::rules::orphans::OrphanPackagesRule;
 
 /// Writes an executable shell script that logs `name<TAB>argv...` to `log`, then runs `body`.
+/// Shim tests in one binary run one at a time. A sibling test's fork can hold a freshly written
+/// shim open for write, and exec then fails with ETXTBSY ("Text file busy").
+static SHIM_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SHIM_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn write_shim(dir: &Path, name: &str, log: &Path, body: &str) -> PathBuf {
     fs::create_dir_all(dir).expect("shim dir");
     let script = format!(
@@ -88,6 +98,7 @@ fn report_for(bin: PathBuf) -> Report {
 
 #[test]
 fn orphans_are_reported_with_sizes_and_only_read_queries_run() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let bin = temp.path().join("usr-bin");
     let log = temp.path().join("calls.log");
@@ -136,6 +147,7 @@ fn orphans_are_reported_with_sizes_and_only_read_queries_run() {
 
 #[test]
 fn no_orphans_is_a_clear_report_when_pacman_exits_one_silently() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let bin = temp.path().join("usr-bin");
     let log = temp.path().join("calls.log");
@@ -149,6 +161,7 @@ fn no_orphans_is_a_clear_report_when_pacman_exits_one_silently() {
 
 #[test]
 fn pacman_stderr_output_on_a_no_match_exit_stays_unknown_not_clear() {
+    let _serial = serial();
     // The shared runner treats a no-match exit as empty only when stderr is also empty.
     let temp = tempfile::tempdir().expect("tempdir");
     let bin = temp.path().join("usr-bin");
@@ -167,6 +180,7 @@ fn pacman_stderr_output_on_a_no_match_exit_stays_unknown_not_clear() {
 
 #[test]
 fn pacman_error_while_listing_is_unavailable_never_clear() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let bin = temp.path().join("usr-bin");
     let log = temp.path().join("calls.log");
@@ -184,6 +198,7 @@ fn pacman_error_while_listing_is_unavailable_never_clear() {
 
 #[test]
 fn unexpected_package_names_are_refused_before_sizes_are_queried() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let bin = temp.path().join("usr-bin");
     let log = temp.path().join("calls.log");
@@ -206,6 +221,7 @@ fn unexpected_package_names_are_refused_before_sizes_are_queried() {
 
 #[test]
 fn package_without_an_installed_size_is_unknown_not_zero() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let bin = temp.path().join("usr-bin");
     let log = temp.path().join("calls.log");
@@ -232,6 +248,7 @@ fn package_without_an_installed_size_is_unknown_not_zero() {
 
 #[test]
 fn missing_pacman_is_unavailable() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let runner = OwnerRunner::new(
         temp.path().join("empty-bin"),
@@ -262,6 +279,7 @@ fn missing_pacman_is_unavailable() {
 
 #[test]
 fn orphan_rule_never_offers_candidates_and_has_no_owner_command() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     fs::create_dir_all(&home).expect("home");
@@ -301,6 +319,7 @@ fn dummy_candidate(home: &Path) -> mole_linux::rules::clean::Candidate {
 
 #[test]
 fn clean_pipeline_reports_orphans_as_attention_and_never_prompts_or_removes() {
+    let _serial = serial();
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     fs::create_dir_all(&home).expect("home");
@@ -363,6 +382,7 @@ fn clean_pipeline_reports_orphans_as_attention_and_never_prompts_or_removes() {
 
 #[test]
 fn orphan_report_is_registered_in_the_system_category() {
+    let _serial = serial();
     let rules = catalog();
     let system: Vec<&str> = rules
         .iter()

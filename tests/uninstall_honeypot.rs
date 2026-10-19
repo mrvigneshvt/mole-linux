@@ -10,6 +10,12 @@ mod fixtures;
 
 #[test]
 fn uninstall_list_keeps_every_honeypot_canary() {
+    if !std::path::Path::new("/usr/bin/pacman").is_file() {
+        eprintln!(
+            "SKIP uninstall_list_keeps_every_honeypot_canary: /usr/bin/pacman absent (scenario runs in the Arch honeypot container)"
+        );
+        return;
+    }
     let temp = tempfile::tempdir().expect("temporary workspace");
     let home = temp.path().join("home");
     let fixture = fixtures::HomeFixture::build(&home).expect("build honeypot");

@@ -210,7 +210,6 @@ pub fn catalog() -> Vec<Box<dyn CleanRule>> {
     rules.extend(super::system::catalog());
     rules.extend(super::owner_cache::registered());
     rules.extend(super::editor_cache::registered());
-    rules.extend(super::automation::registered());
     rules.push(super::journal::registered());
     rules.extend(super::python::registered());
     rules

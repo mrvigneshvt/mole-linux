@@ -170,3 +170,62 @@ fn an_unavailable_scan_root_is_an_error_not_an_empty_inventory() {
     let home = tempdir().expect("home");
     assert!(scan_artifacts(&home.path().join("missing"), 6).is_err());
 }
+
+#[test]
+fn large_git_probe_inventory_handles_many_linked_worktrees_and_tracked_artifacts() {
+    use std::time::Duration;
+
+    let home = tempdir().expect("home");
+    let workspace = home.path().join("Workspace");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let repo_count = 40;
+    for index in 0..repo_count {
+        let main = workspace.join(format!("repo-{index}"));
+        fs::create_dir_all(main.join("target")).expect("target");
+        run_git(&main, &["init", "-q"]);
+        run_git(&main, &["config", "user.email", "test@example.com"]);
+        run_git(&main, &["config", "user.name", "Test"]);
+        let tracked_count = if index == 0 { 6_000 } else { 250 };
+        for file in 0..tracked_count {
+            fs::write(
+                main.join("target").join(format!("tracked-{file:05}.rs")),
+                "x",
+            )
+            .expect("tracked file");
+        }
+        run_git(&main, &["add", "target"]);
+        run_git(&main, &["commit", "-qm", "tracked target tree"]);
+        let worktree = workspace.join(format!("worktree-{index}"));
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                worktree.to_str().expect("utf8 path"),
+            ],
+        );
+    }
+
+    let candidates =
+        scan_artifacts_with_context(&workspace, 4, Duration::from_secs(30), home.path(), "")
+            .expect("large linked-worktree inventory");
+    assert_eq!(candidates.len(), repo_count * 2);
+    assert!(candidates.iter().all(|candidate| candidate.protected));
+}
+
+fn run_git(cwd: &std::path::Path, args: &[&str]) {
+    use std::process::Command;
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("git command");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

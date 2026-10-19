@@ -4,9 +4,9 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::process::Stdio;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -94,6 +94,8 @@ pub struct Candidate {
     pub size: SizeEstimate,
     pub cachedir_tag: bool,
     pub selected_by_default: bool,
+    pub authored_content: bool,
+    pub unavailable_reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,10 +105,10 @@ pub enum Activity {
     Uncertain,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SizeEstimate {
     Known(u64),
-    Unknown,
+    Unknown(String),
 }
 
 /// Reads explicit roots; missing, empty, or comment-only files use the
@@ -417,12 +419,31 @@ fn run_bounded_git_probe(mut command: Command, deadline: Instant) -> io::Result<
         .take()
         .ok_or_else(|| io::Error::other("git probe stdout was not captured"))?;
     let (sender, receiver) = mpsc::sync_channel(1);
-    let reader = thread::spawn(move || {
-        use std::io::Read;
-        let mut byte = [0_u8; 1];
-        let result = stdout.read(&mut byte).map(|count| count > 0);
-        let _ = sender.send(result);
-    });
+    let reader = match thread::Builder::new()
+        .name("purge-git-probe".into())
+        .spawn(move || {
+            use std::io::Read;
+            let mut buffer = [0_u8; 16 * 1024];
+            let mut found_content = false;
+            let result = loop {
+                match stdout.read(&mut buffer) {
+                    Ok(0) => break Ok(found_content),
+                    Ok(_) => found_content = true,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => break Err(error),
+                }
+            };
+            let _ = sender.send(result);
+        }) {
+        Ok(reader) => reader,
+        Err(error) => {
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+            }
+            let _ = child.wait()?;
+            return Err(error);
+        }
+    };
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -439,26 +460,13 @@ fn run_bounded_git_probe(mut command: Command, deadline: Instant) -> io::Result<
             ));
         }
         match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
-            Ok(Ok(true)) => {
-                if child.try_wait()?.is_none() {
-                    child.kill()?;
-                }
-                let _ = child.wait()?;
-                reader
-                    .join()
-                    .map_err(|_| io::Error::other("git probe reader panicked"))?;
-                return Ok(true);
-            }
-            Ok(Ok(false)) => {
-                // stdout closed without a byte: the listing is complete and only the
-                // exit status remains. Waiting here avoids reading the reader's
-                // disconnect as a failure when git has not been reaped yet.
+            Ok(Ok(found_content)) => {
                 let status = wait_for_exit(&mut child, deadline);
                 reader
                     .join()
                     .map_err(|_| io::Error::other("git probe reader panicked"))?;
                 return if status?.success() {
-                    Ok(false)
+                    Ok(found_content)
                 } else {
                     Err(io::Error::other(
                         "git could not verify tracked artifact content",
@@ -477,23 +485,28 @@ fn run_bounded_git_probe(mut command: Command, deadline: Instant) -> io::Result<
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if child.try_wait()?.is_none() {
+                    child.kill()?;
+                }
+                let _ = child.wait()?;
+                reader
+                    .join()
+                    .map_err(|_| io::Error::other("git probe reader panicked"))?;
                 return Err(io::Error::other("git probe reader disconnected"));
             }
         }
     }
 }
 
-fn wait_for_exit(
-    child: &mut std::process::Child,
-    deadline: Instant,
-) -> io::Result<std::process::ExitStatus> {
+fn wait_for_exit(child: &mut std::process::Child, deadline: Instant) -> io::Result<ExitStatus> {
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             if child.try_wait()?.is_none() {
-                child.kill()?;
+                let _ = child.kill();
             }
             let _ = child.wait()?;
             return Err(io::Error::new(
@@ -501,7 +514,7 @@ fn wait_for_exit(
                 "git content probe timed out",
             ));
         }
-        thread::sleep(Duration::from_millis(1));
+        thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 }
 
@@ -649,10 +662,15 @@ fn collect_artifacts(
         }
         let cachedir_tag = has_valid_cachedir_tag(&path)?;
         if TARGETS.contains(&entry.file_name().to_string_lossy().as_ref()) || cachedir_tag {
-            let protected_content = has_authored_content_with_budget(&path, remaining(deadline))?;
+            let (authored_content, unavailable_reason) =
+                match has_authored_content_with_budget(&path, remaining(deadline)) {
+                    Ok(protected) => (protected, None),
+                    Err(error) => (false, Some(error.to_string())),
+                };
             let activity =
                 classify_activity_with_budget(&path, SystemTime::now(), remaining(deadline));
-            let protected = protected_content
+            let protected = authored_content
+                || unavailable_reason.is_some()
                 || is_protected_artifact(&path)
                 || activity == Activity::Uncertain;
             found.push(Candidate {
@@ -661,6 +679,8 @@ fn collect_artifacts(
                 size: measure_size_with_budget(&path, remaining(deadline)),
                 cachedir_tag,
                 selected_by_default: activity == Activity::Old && !protected,
+                authored_content,
+                unavailable_reason,
                 path,
             });
         } else {
@@ -747,29 +767,51 @@ pub fn measure_size_with_budget(path: &Path, budget: Duration) -> SizeEstimate {
     let mut total = 0_u64;
     while let Some(current) = pending.pop() {
         if check_deadline(deadline).is_err() {
-            return SizeEstimate::Unknown;
+            return SizeEstimate::Unknown("size calculation exceeded its time budget".to_owned());
         }
-        let Ok(metadata) = fs::symlink_metadata(&current) else {
-            return SizeEstimate::Unknown;
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return SizeEstimate::Unknown(format!("could not read metadata: {error}"));
+            }
         };
-        if metadata.is_file() {
-            let Some(size) = total.checked_add(metadata.len()) else {
-                return SizeEstimate::Unknown;
+        if metadata.is_file() || metadata.is_dir() {
+            let Some(allocated) = metadata.blocks().checked_mul(512) else {
+                return SizeEstimate::Unknown("allocated byte count overflowed".to_owned());
+            };
+            let Some(size) = total.checked_add(allocated) else {
+                return SizeEstimate::Unknown("allocated size total overflowed".to_owned());
             };
             total = size;
-        } else if metadata.is_dir() {
-            let Ok(entries) = fs::read_dir(current) else {
-                return SizeEstimate::Unknown;
+        }
+        if metadata.is_dir() {
+            let entries = match fs::read_dir(&current) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    return SizeEstimate::Unknown(format!("could not read directory: {error}"));
+                }
             };
             for entry in entries {
                 if check_deadline(deadline).is_err() {
-                    return SizeEstimate::Unknown;
+                    return SizeEstimate::Unknown(
+                        "size calculation exceeded its time budget".to_owned(),
+                    );
                 }
-                let Ok(entry) = entry else {
-                    return SizeEstimate::Unknown;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        return SizeEstimate::Unknown(format!(
+                            "could not read directory entry: {error}"
+                        ));
+                    }
                 };
-                let Ok(file_type) = entry.file_type() else {
-                    return SizeEstimate::Unknown;
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(error) => {
+                        return SizeEstimate::Unknown(format!(
+                            "could not inspect directory entry: {error}"
+                        ));
+                    }
                 };
                 if file_type.is_dir() || file_type.is_file() {
                     pending.push(entry.path());

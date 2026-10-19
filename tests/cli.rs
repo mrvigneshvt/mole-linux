@@ -12,23 +12,10 @@ fn run(args: &[&str]) -> Output {
 
 #[test]
 fn unsupported_subcommands_parse_flags_and_exit_two() {
-    let cases: &[(&[&str], u32)] = &[
-        (
-            &[
-                "purge",
-                "--dry-run",
-                "--paths",
-                "target",
-                "--include-empty",
-                "--yes",
-            ],
-            31,
-        ),
-        (
-            &["uninstall", "--dry-run", "--permanent", "--whitelist"],
-            36,
-        ),
-    ];
+    let cases: &[(&[&str], u32)] = &[(
+        &["uninstall", "--dry-run", "--permanent", "--whitelist"],
+        36,
+    )];
 
     for (args, issue) in cases {
         let output = run(args);
@@ -299,4 +286,19 @@ fn help_matches_cli_snapshot() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("help is UTF-8");
     assert_eq!(stdout, include_str!("fixtures/cli-help.txt"));
+}
+
+#[test]
+fn purge_help_documents_every_flag() {
+    let output = run(&["purge", "--help"]);
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    for flag in ["--dry-run", "--paths", "--include-empty", "--yes"] {
+        assert!(help.contains(flag), "missing help for {flag}: {help}");
+        let line = help.lines().find(|line| line.contains(flag)).unwrap_or("");
+        assert!(
+            line.split_whitespace().count() > 1,
+            "no description for {flag}: {line}"
+        );
+    }
 }

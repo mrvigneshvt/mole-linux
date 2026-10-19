@@ -12,6 +12,7 @@ Build the release binary and run scenarios (each runs as the non-root `mole` use
 cargo build --release
 tests/honeypot/docker/run.sh smoke
 tests/honeypot/docker/run.sh paccache-dryrun
+tests/honeypot/docker/run.sh clean-pacman-apply
 ```
 
-The Arch image installs `pacman-contrib`, creates a non-root user with passwordless sudo and Git, and seeds four nonempty 1 MiB versions of each of two packages. `smoke.sh` checks `mole-linux --version`; `paccache-dryrun.sh` runs `paccache -dk3 -v` and checks that it lists both oldest versions while retaining newer ones. The binary and selected scenario script are mounted read-only. The runner verifies all canary SHA-256 entries even when a scenario fails and returns nonzero for scenario or canary failure. The image tag is `mole-linux-honeypot:latest`.
+The Arch image installs `pacman-contrib`, creates a non-root user with passwordless sudo and Git, and seeds four nonempty 1 MiB versions of each of two packages. `smoke.sh` checks `mole-linux --version`; `paccache-dryrun.sh` runs `paccache -dk3 -v` and checks that it lists both oldest versions while retaining newer ones. `clean-pacman-apply.sh` runs `mole-linux clean --dry-run --select pacman-cache-keep3` (checking nothing changes), then `clean --yes --select pacman-cache-keep3` through real passwordless sudo, and checks that exactly the versions beyond keep=3 (`1.0` and `2.0`) are removed. The binary and selected scenario script are mounted read-only. The runner verifies all canary SHA-256 entries even when a scenario fails and returns nonzero for scenario or canary failure. The image tag is `mole-linux-honeypot:latest`.

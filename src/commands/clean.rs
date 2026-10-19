@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -9,12 +10,18 @@ use std::time::{Duration, Instant, SystemTime};
 use rustix::fs::statvfs;
 
 use crate::core::oplog::{OpLog, Session, SessionSummary};
+use crate::core::outcome::Outcome;
 use crate::core::paths::XdgPaths;
+use crate::core::privilege::{
+    Consent, OwnerCommand, OwnerRun, OwnerRunner, RunMode, ask_owner_consent,
+};
 use crate::core::proc::{self, ProcessState};
 use crate::core::sink::{DeleteMode, SinkContext, delete};
 use crate::core::validate::validate_path_for_deletion;
 use crate::core::whitelist::Whitelist;
-use crate::rules::clean::{Candidate, Category, CleanRule, DiscoveryStatus, RuleContext, catalog};
+use crate::rules::clean::{
+    Candidate, Category, CleanRule, DiscoveryStatus, RecoveryMode, RuleContext, catalog,
+};
 use crate::scan::{self, Node, NodeStatus};
 
 static CANCEL_SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -124,12 +131,41 @@ pub fn run(args: CleanArgs) -> io::Result<()> {
 }
 
 /// Discovers, previews, validates, confirms, and sends eligible items through the sink.
+/// Owner actions run through the system `OwnerRunner`; `--yes` grants their consent up front.
 pub fn execute_rules(
     args: &CleanArgs,
     rules: &[&dyn CleanRule],
     context: &RuleContext<'_>,
     sink: &SinkContext,
     session: &mut Session,
+) -> io::Result<CleanSummary> {
+    let consent = if args.yes {
+        Consent::Granted
+    } else {
+        Consent::Unasked
+    };
+    let mut owner = OwnerRunner::system(consent);
+    execute_rules_with_owner(
+        args,
+        rules,
+        context,
+        sink,
+        session,
+        &mut owner,
+        &ask_owner_consent,
+    )
+}
+
+/// `execute_rules` with the owner runner and consent prompt injected. The prompt receives the
+/// exact argv of every owner command selected for this run and is asked at most once.
+pub fn execute_rules_with_owner(
+    args: &CleanArgs,
+    rules: &[&dyn CleanRule],
+    context: &RuleContext<'_>,
+    sink: &SinkContext,
+    session: &mut Session,
+    owner: &mut OwnerRunner,
+    prompt: &dyn Fn(&[Vec<OsString>]) -> bool,
 ) -> io::Result<CleanSummary> {
     let categories = parse_filter(args.categories.as_deref());
     let selected = parse_filter(args.select.as_deref());
@@ -169,7 +205,7 @@ pub fn execute_rules(
         if !selected.is_empty() && !selected.contains(id) && !selected.contains(category.as_str()) {
             continue;
         }
-        let discovery = rule.discover(context);
+        let discovery = rule.discover_with_owner(context, owner);
         match &discovery.status {
             DiscoveryStatus::Complete => {}
             DiscoveryStatus::Partial(reason) => println!(
@@ -214,7 +250,10 @@ pub fn execute_rules(
             record(&mut summary, session, "skipped", &candidate.path)?;
             continue;
         }
-        if candidate.apparent_size.is_none() || candidate.allocated_size.is_none() {
+        // Owner-native targets are whole cache directories the owner tool trims, so a directory size would overstate the action.
+        if candidate.recovery != RecoveryMode::OwnerNative
+            && (candidate.apparent_size.is_none() || candidate.allocated_size.is_none())
+        {
             measure_candidate_size(&mut candidate, size_scan_deadline, context.cancel);
         }
         if context.cancel.load(Ordering::Relaxed) {
@@ -241,8 +280,11 @@ pub fn execute_rules(
             continue;
         }
         let explicitly_selected = selected.contains(&rule_id)
+            || selected.contains(category_for_rule(rules, &rule_id).as_str())
             || selected.contains(candidate.path.to_string_lossy().as_ref());
-        let selected_for_action = candidate.selected_by_default || explicitly_selected;
+        // Owner actions run with sudo, so only an explicit --select runs them; sink items keep the default.
+        let selected_for_action = explicitly_selected
+            || (candidate.selected_by_default && candidate.recovery != RecoveryMode::OwnerNative);
         println!(
             "{} [{}] {} · {} · logical={} · allocated={}",
             if selected_for_action {
@@ -278,6 +320,11 @@ pub fn execute_rules(
             record(&mut summary, session, "unchanged", &candidate.path)?;
         }
     } else {
+        let listing: Vec<Vec<OsString>> = apply
+            .iter()
+            .filter_map(|(rule_id, candidate)| owner_command_for(rules, rule_id, candidate))
+            .map(|command| owner.argv(&command))
+            .collect();
         let mut sized_objects = BTreeSet::new();
         for (rule_id, candidate) in apply {
             if context.cancel.load(Ordering::Relaxed) {
@@ -306,17 +353,24 @@ pub fn execute_rules(
                 continue;
             }
             let mode = match candidate.recovery {
-                crate::rules::clean::RecoveryMode::OwnerNative => {
-                    record(&mut summary, session, "unavailable", &candidate.path)?;
-                    println!(
-                        "Unavailable: {} (owner-native action not registered)",
-                        display_path(&candidate.path)
-                    );
+                RecoveryMode::OwnerNative => {
+                    let run = match owner_command_for(rules, &rule_id, &candidate) {
+                        Some(command) => owner.run(&command, RunMode::Apply, || prompt(&listing)),
+                        None => OwnerRun {
+                            outcome: Outcome::Unavailable,
+                            argv: Vec::new(),
+                            reason: Some("owner-native action not registered".to_owned()),
+                        },
+                    };
+                    record_owner_run(&mut summary, session, &candidate.path, &run)?;
+                    if run.outcome == Outcome::Applied {
+                        // Owner tools expose no per-item sizes, so the summed total is unknown.
+                        summary.allocated_applied = None;
+                    }
                     continue;
                 }
-                crate::rules::clean::RecoveryMode::Irreversible => DeleteMode::Permanent,
-                crate::rules::clean::RecoveryMode::Regenerate
-                | crate::rules::clean::RecoveryMode::Trash => DeleteMode::Trash,
+                RecoveryMode::Irreversible => DeleteMode::Permanent,
+                RecoveryMode::Regenerate | RecoveryMode::Trash => DeleteMode::Trash,
             };
             match delete(&candidate.path, &candidate.identity, mode, sink) {
                 Ok(_) => {
@@ -365,6 +419,10 @@ fn protected_reason(candidate: &Candidate, context: &RuleContext<'_>) -> Option<
             .is_some_and(|resolved| context.whitelist.matches(&resolved))
     {
         return Some("whitelist".to_owned());
+    }
+    if candidate.recovery == RecoveryMode::OwnerNative {
+        // Owner tools choose their own targets, outside HOME; the HOME policy guards sink deletes only.
+        return None;
     }
     validate_path_for_deletion(&candidate.path, context.home, context.xdg)
         .err()
@@ -472,15 +530,58 @@ fn deduplicate_candidates(candidates: &mut Vec<(String, Candidate)>) {
     candidates.sort_by_key(|(_, candidate)| candidate.path.components().count());
     let mut accepted: Vec<(String, Candidate)> = Vec::new();
     for entry in candidates.drain(..) {
-        if accepted
-            .iter()
-            .any(|(_, existing)| entry.1.path.starts_with(&existing.path))
+        // Owner actions share a cache directory but are distinct commands, so they never collapse.
+        let owner_native = entry.1.recovery == RecoveryMode::OwnerNative;
+        if !owner_native
+            && accepted.iter().any(|(_, existing)| {
+                existing.recovery != RecoveryMode::OwnerNative
+                    && entry.1.path.starts_with(&existing.path)
+            })
         {
             continue;
         }
         accepted.push(entry);
     }
     *candidates = accepted;
+}
+
+fn owner_command_for(
+    rules: &[&dyn CleanRule],
+    rule_id: &str,
+    candidate: &Candidate,
+) -> Option<OwnerCommand> {
+    if candidate.recovery != RecoveryMode::OwnerNative {
+        return None;
+    }
+    rules
+        .iter()
+        .find(|rule| rule.id() == rule_id)?
+        .owner_command(candidate)
+}
+
+fn record_owner_run(
+    summary: &mut CleanSummary,
+    session: &mut Session,
+    path: &Path,
+    run: &OwnerRun,
+) -> io::Result<()> {
+    let outcome = match run.outcome {
+        Outcome::Applied => "applied",
+        Outcome::Unchanged => "unchanged",
+        Outcome::Skipped => "skipped",
+        Outcome::Unavailable => "unavailable",
+        Outcome::Attention => "attention",
+        Outcome::Failed => "failed",
+    };
+    if let Some(reason) = &run.reason {
+        println!(
+            "{}: {} ({})",
+            display_path(path),
+            outcome,
+            escape_text(reason)
+        );
+    }
+    record(summary, session, outcome, path)
 }
 
 fn category_for_rule(rules: &[&dyn CleanRule], id: &str) -> Category {

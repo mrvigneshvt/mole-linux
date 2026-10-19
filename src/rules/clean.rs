@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
 use crate::core::paths::XdgPaths;
+use crate::core::privilege::{OwnerCommand, OwnerRunner};
 use crate::core::proc::ProcessState;
 use crate::core::sink::Identity;
 use crate::core::whitelist::Whitelist;
@@ -96,6 +97,17 @@ pub trait CleanRule: Send + Sync {
     fn final_guard(&self, _candidate: &Candidate, _ctx: &RuleContext<'_>) -> Result<(), String> {
         Ok(())
     }
+
+    /// Discovery for rules that need an owner tool to preview (e.g. `paccache -dk3`).
+    /// Plain rules keep the default, which ignores the runner.
+    fn discover_with_owner(&self, ctx: &RuleContext<'_>, _owner: &OwnerRunner) -> Discovery {
+        self.discover(ctx)
+    }
+
+    /// The owner command that applies an `OwnerNative` candidate. Sink-backed rules return `None`.
+    fn owner_command(&self, _candidate: &Candidate) -> Option<OwnerCommand> {
+        None
+    }
 }
 
 /// Owner-dependent rules must preserve `Unknown`; it cannot authorize cleanup.
@@ -134,10 +146,12 @@ pub fn candidate(
     })
 }
 
-/// Concrete Linux cleanup targets are registered by M4.2 and later units.
+/// Every registered Linux cleanup rule. Filters are validated against these ids and categories.
 pub fn catalog() -> Vec<Box<dyn CleanRule>> {
-    vec![
+    let mut rules = vec![
         super::browser::registered(),
         super::project_cache::registered(),
-    ]
+    ];
+    rules.extend(super::system::catalog());
+    rules
 }

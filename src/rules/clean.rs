@@ -221,6 +221,7 @@ pub fn catalog() -> Vec<Box<dyn CleanRule>> {
     rules.extend(super::docker::registered());
     rules.push(super::journal::registered());
     rules.extend(super::python::registered());
+    rules.extend(super::toolchain_cache::registered());
     rules
 }
 

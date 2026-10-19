@@ -6,6 +6,8 @@
 mod bun;
 mod conda;
 mod corepack;
+mod go;
+mod mise;
 mod npm;
 mod pip;
 mod pnpm;
@@ -28,6 +30,8 @@ use crate::rules::clean::OwnerAction;
 pub use bun::Bun;
 pub use conda::Conda;
 pub use corepack::Corepack;
+pub use go::Go;
+pub use mise::Mise;
 pub use npm::Npm;
 pub use pip::Pip;
 pub use pnpm::Pnpm;
@@ -55,6 +59,7 @@ pub struct AdapterEnv {
     pub corepack_home: Option<OsString>,
     pub bun_install_cache_dir: Option<OsString>,
     pub bun_install: Option<OsString>,
+    pub mise_cache_dir: Option<OsString>,
 }
 
 /// A usable binary, the cache directory its owner reports, and every directory its cleanup may change.

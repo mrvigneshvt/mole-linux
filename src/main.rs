@@ -8,6 +8,7 @@ use std::thread;
 use clap::CommandFactory;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, shells};
+use mole_linux::commands::clean::CleanArgs;
 use mole_linux::commands::status::StatusArgs;
 use mole_linux::core::fsutil::{atomic_replace, resolve_symlink_chain};
 use mole_linux::{commands::snapshots, scan, tui};
@@ -40,7 +41,7 @@ enum Command {
     /// List Btrfs and Snapper snapshots without changing them
     Snapshots,
     /// Clean supported caches
-    Clean(CleanArgs),
+    Clean(CliCleanArgs),
     /// Purge development artifacts
     Purge(PurgeArgs),
     /// Find installer files
@@ -65,7 +66,7 @@ struct AnalyzeArgs {
 }
 
 #[derive(Debug, Args)]
-struct CleanArgs {
+struct CliCleanArgs {
     #[arg(long)]
     dry_run: bool,
     #[arg(long)]
@@ -237,7 +238,14 @@ fn run() -> io::Result<()> {
         }
         Command::Status(args) => mole_linux::commands::status::run(args),
         Command::Snapshots => snapshots::run(),
-        Command::Clean(_) => not_implemented("clean", 16),
+        Command::Clean(args) => mole_linux::commands::clean::run(CleanArgs {
+            dry_run: args.dry_run,
+            categories: args.categories,
+            select: args.select,
+            exclude: args.exclude,
+            external: args.external,
+            whitelist: args.whitelist,
+        }),
         Command::Purge(_) => not_implemented("purge", 31),
         Command::Installer(_) => not_implemented("installer", 33),
         Command::Uninstall(_) => not_implemented("uninstall", 34),

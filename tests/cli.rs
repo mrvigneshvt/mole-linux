@@ -14,21 +14,6 @@ fn unsupported_subcommands_parse_flags_and_exit_two() {
     let cases: &[(&[&str], u32)] = &[
         (
             &[
-                "clean",
-                "--dry-run",
-                "--categories",
-                "cache",
-                "--select",
-                "one",
-                "--exclude",
-                "two",
-                "--external",
-                "--whitelist",
-            ],
-            16,
-        ),
-        (
-            &[
                 "purge",
                 "--dry-run",
                 "--paths",
@@ -309,9 +294,15 @@ fn analyze_json_emits_a_document_instead_of_the_unimplemented_error() {
 #[test]
 fn global_debug_is_accepted_before_and_after_subcommand() {
     for args in [&["--debug", "clean"][..], &["clean", "--debug"][..]] {
-        let output = run(args);
-        assert_eq!(output.status.code(), Some(2), "args: {args:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("not implemented yet (#16)"));
+        let home = tempdir().expect("temporary HOME");
+        let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
+            .args(args)
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .output()
+            .expect("run clean");
+        assert_eq!(output.status.code(), Some(0), "args: {args:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Clean complete"));
     }
 }
 

@@ -2,11 +2,12 @@ use std::os::unix::fs::symlink;
 use std::process::{Command, Output, Stdio};
 use tempfile::tempdir;
 
+#[path = "support/home.rs"]
+mod home_support;
+use home_support::CommandHomeExt;
+
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_mole-linux"))
-        .args(args)
-        .output()
-        .expect("run mole-linux")
+    home_support::output(args)
 }
 
 #[test]
@@ -87,7 +88,7 @@ fn completion_install_dry_run_previews_and_remove_clears_only_marked_block() {
 
     let preview = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["completion", "--dry-run"])
-        .env("HOME", home.path())
+        .isolated_home(home.path())
         .env("SHELL", "/bin/bash")
         .output()
         .expect("run preview");
@@ -111,7 +112,7 @@ fn completion_install_dry_run_previews_and_remove_clears_only_marked_block() {
 
     let install = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["completion"])
-        .env("HOME", home.path())
+        .isolated_home(home.path())
         .env("SHELL", "/bin/bash")
         .output()
         .expect("run install");
@@ -126,7 +127,7 @@ fn completion_install_dry_run_previews_and_remove_clears_only_marked_block() {
 
     let remove_preview = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["completion", "--remove", "--dry-run"])
-        .env("HOME", home.path())
+        .isolated_home(home.path())
         .env("SHELL", "/bin/bash")
         .output()
         .expect("preview removal");
@@ -145,7 +146,7 @@ fn completion_install_dry_run_previews_and_remove_clears_only_marked_block() {
 
     let remove = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["completion", "--remove"])
-        .env("HOME", home.path())
+        .isolated_home(home.path())
         .env("SHELL", "/bin/bash")
         .output()
         .expect("run remove");
@@ -165,7 +166,7 @@ fn completion_fish_closed_pipe_exits_cleanly() {
     let home = tempdir().expect("temp home");
     let mut child = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["completion", "fish"])
-        .env("HOME", home.path())
+        .isolated_home(home.path())
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn completion");
@@ -183,7 +184,7 @@ fn completion_stdout_write_errors_are_reported() {
         .expect("open full device");
     let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["completion", "fish"])
-        .env("HOME", home.path())
+        .isolated_home(home.path())
         .stdout(Stdio::from(full))
         .output()
         .expect("run completion");
@@ -206,7 +207,7 @@ fn completion_follows_rc_symlinks_and_refuses_broken_or_cyclic_chains() {
 
     let installed = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["completion"])
-        .env("HOME", home.path())
+        .isolated_home(home.path())
         .env("SHELL", "/bin/bash")
         .output()
         .expect("install completion");
@@ -230,7 +231,7 @@ fn completion_follows_rc_symlinks_and_refuses_broken_or_cyclic_chains() {
     .expect("create broken link");
     let broken = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["completion"])
-        .env("HOME", broken_home.path())
+        .isolated_home(broken_home.path())
         .env("SHELL", "/bin/bash")
         .output()
         .expect("run broken link case");
@@ -250,7 +251,7 @@ fn completion_follows_rc_symlinks_and_refuses_broken_or_cyclic_chains() {
     .expect("create second cycle link");
     let cyclic = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["completion"])
-        .env("HOME", cyclic_home.path())
+        .isolated_home(cyclic_home.path())
         .env("SHELL", "/bin/bash")
         .output()
         .expect("run cyclic link case");
@@ -280,6 +281,7 @@ fn analyze_json_emits_a_document_instead_of_the_unimplemented_error() {
     let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["analyze", "--json"])
         .arg(dir.path())
+        .isolated_home(dir.path())
         .output()
         .expect("run analyze JSON");
     assert!(
@@ -297,8 +299,7 @@ fn global_debug_is_accepted_before_and_after_subcommand() {
         let home = tempdir().expect("temporary HOME");
         let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
             .args(args)
-            .env("HOME", home.path())
-            .env("XDG_STATE_HOME", home.path().join("state"))
+            .isolated_home(home.path())
             .output()
             .expect("run clean");
         assert_eq!(output.status.code(), Some(0), "args: {args:?}");

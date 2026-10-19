@@ -1,5 +1,8 @@
 use std::fs;
 use std::process::Command;
+#[path = "support/home.rs"]
+mod home_support;
+use home_support::CommandHomeExt;
 
 #[test]
 fn clean_dry_run_reports_preview_and_measured_space_without_mutating_home() {
@@ -12,11 +15,7 @@ fn clean_dry_run_reports_preview_and_measured_space_without_mutating_home() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["clean", "--dry-run"])
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_DATA_HOME", home.join(".local/share"))
-        .env("XDG_STATE_HOME", home.join(".local/state"))
-        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .isolated_home(&home)
         .output()
         .expect("run clean preview");
 
@@ -27,12 +26,36 @@ fn clean_dry_run_reports_preview_and_measured_space_without_mutating_home() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Clean preview"), "{stdout}");
-    assert!(stdout.contains("Measured space change"), "{stdout}");
+    assert!(
+        stdout.contains("Measured statvfs free-space delta"),
+        "{stdout}"
+    );
     assert!(cache.join("canary").exists(), "dry-run changed the target");
-    let operations = fs::read_to_string(home.join(".local/state/mole-linux/operations.log"))
+    let operations = fs::read_to_string(home.join(".test-xdg/state/mole-linux/operations.log"))
         .expect("operation log written under temporary HOME");
     assert!(operations.contains("clean-dry-run run="));
     assert!(operations.contains("session started"));
+    assert!(
+        operations.contains("Z =========="),
+        "timestamps need a UTC marker: {operations}"
+    );
+}
+
+#[test]
+fn clean_accepts_yes_for_confirmed_apply_mode() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    fs::create_dir(&home).expect("create temporary home");
+    let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
+        .args(["clean", "--yes", "--dry-run"])
+        .isolated_home(&home)
+        .output()
+        .expect("run clean");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -52,8 +75,7 @@ fn clean_accepts_rule_filters_and_records_a_zero_rule_preview() {
             "--exclude",
             "browser-cache",
         ])
-        .env("HOME", &home)
-        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .isolated_home(&home)
         .output()
         .expect("run clean preview");
 
@@ -62,5 +84,5 @@ fn clean_accepts_rule_filters_and_records_a_zero_rule_preview() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Rules: 0"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Discovered: 0"));
 }

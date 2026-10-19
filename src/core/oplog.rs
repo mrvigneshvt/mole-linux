@@ -177,7 +177,7 @@ fn load_sessions(path: &Path) -> io::Result<Vec<HistorySession>> {
             let key = (command.clone(), run_id.clone());
             let ambiguous = run_id.is_empty() && active.contains_key(&key);
             if let Some(previous) = active.get(&key).copied() {
-                sessions[previous].ended_at = started.to_string();
+                sessions[previous].ended_at = normalize_timestamp(started);
                 if ambiguous {
                     sessions[previous].ambiguous = true;
                 }
@@ -186,7 +186,7 @@ fn load_sessions(path: &Path) -> io::Result<Vec<HistorySession>> {
             sessions.push(SessionBuilder {
                 command: command.clone(),
                 run_id: run_id.clone(),
-                started_at: started.to_string(),
+                started_at: normalize_timestamp(started),
                 size: "0B".to_string(),
                 ambiguous,
                 marker_sequence,
@@ -213,9 +213,9 @@ fn load_sessions(path: &Path) -> io::Result<Vec<HistorySession>> {
             let session = &mut sessions[index];
             let (ended, items, size, malformed) = parse_end_summary(rest);
             if session.started_at.is_empty() {
-                session.started_at = ended.to_string();
+                session.started_at = normalize_timestamp(ended);
             }
-            session.ended_at = ended.to_string();
+            session.ended_at = normalize_timestamp(ended);
             session.items = items.unwrap_or(0);
             if let Some(size) = size {
                 session.size = size.to_string();
@@ -236,7 +236,7 @@ fn load_sessions(path: &Path) -> io::Result<Vec<HistorySession>> {
                 sessions.push(SessionBuilder {
                     command: command.clone(),
                     run_id: run_id.clone(),
-                    started_at: timestamp.to_string(),
+                    started_at: normalize_timestamp(timestamp),
                     size: "0B".to_string(),
                     marker_sequence,
                     ..SessionBuilder::default()
@@ -365,14 +365,30 @@ fn valid_size(value: &str) -> bool {
 
 fn valid_timestamp(value: &str) -> bool {
     let bytes = value.as_bytes();
-    bytes.len() == 19
+    (bytes.len() == 19
         && [4, 7].iter().all(|index| bytes[*index] == b'-')
         && bytes[10] == b' '
         && [13, 16].iter().all(|index| bytes[*index] == b':')
         && bytes
             .iter()
             .enumerate()
-            .all(|(index, byte)| [4, 7, 10, 13, 16].contains(&index) || byte.is_ascii_digit())
+            .all(|(index, byte)| [4, 7, 10, 13, 16].contains(&index) || byte.is_ascii_digit()))
+        || (bytes.len() == 20
+            && [4, 7].iter().all(|index| bytes[*index] == b'-')
+            && bytes[10] == b'T'
+            && [13, 16].iter().all(|index| bytes[*index] == b':')
+            && bytes[19] == b'Z'
+            && bytes.iter().enumerate().all(|(index, byte)| {
+                [4, 7, 10, 13, 16, 19].contains(&index) || byte.is_ascii_digit()
+            }))
+}
+
+fn normalize_timestamp(value: &str) -> String {
+    if value.len() == 19 && value.as_bytes().get(10) == Some(&b' ') && valid_timestamp(value) {
+        format!("{}T{}Z", &value[..10], &value[11..])
+    } else {
+        value.to_owned()
+    }
 }
 
 fn parse_operation(line: &str) -> Option<(&str, &str, &str, &str)> {
@@ -626,7 +642,7 @@ fn format_utc_timestamp(seconds: u64) -> String {
         year += 1;
     }
     format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
         day_seconds / 3_600,
         day_seconds % 3_600 / 60,
         day_seconds % 60
@@ -963,6 +979,11 @@ mod tests {
             .expect("read operations log");
         let text = String::from_utf8(bytes).expect("UTF-8 log");
         assert!(text.contains("[clean-dry-run run="));
+        assert!(text.contains("session started at 20"));
+        assert!(
+            text.contains("Z =========="),
+            "timestamps need a UTC marker: {text}"
+        );
         assert!(text.contains("TASK_FAILED failed /tmp/path\\x09with-control"));
         assert_eq!(text.lines().count(), 9);
         assert!(

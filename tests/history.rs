@@ -2,13 +2,15 @@ use std::fs;
 use std::process::Command;
 
 use tempfile::tempdir;
+#[path = "support/home.rs"]
+mod home_support;
+use home_support::CommandHomeExt;
 
 fn run_history(home: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["history"])
         .args(args)
-        .env("HOME", home)
-        .env_remove("XDG_STATE_HOME")
+        .isolated_home(home)
         .output()
         .expect("run history")
 }
@@ -21,7 +23,7 @@ fn run_history_at(
     Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["history"])
         .args(args)
-        .env("HOME", home)
+        .isolated_home(home)
         .env("XDG_STATE_HOME", state)
         .output()
         .expect("run history")
@@ -46,7 +48,7 @@ fn history_reads_xdg_state_logs_and_emits_recent_sessions_as_json() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["history", "--json", "--limit", "1"])
-        .env("HOME", home.path())
+        .isolated_home(home.path())
         .env("XDG_STATE_HOME", &state)
         .output()
         .expect("run history");
@@ -59,8 +61,8 @@ fn history_reads_xdg_state_logs_and_emits_recent_sessions_as_json() {
     assert_eq!(value["sessions"][0]["command"], "clean");
     assert_eq!(value["sessions"][0]["run_id"], "");
     assert_eq!(value["sessions"][0]["attribution"], "command");
-    assert_eq!(value["sessions"][0]["started_at"], "2026-10-19 10:00:00");
-    assert_eq!(value["sessions"][0]["ended_at"], "2026-10-19 10:00:02");
+    assert_eq!(value["sessions"][0]["started_at"], "2026-10-19T10:00:00Z");
+    assert_eq!(value["sessions"][0]["ended_at"], "2026-10-19T10:00:02Z");
     assert_eq!(value["sessions"][0]["items"], 1);
     assert_eq!(value["sessions"][0]["size"], "2KB");
     assert_eq!(value["sessions"][0]["operation_count"], 1);
@@ -92,7 +94,7 @@ fn history_keeps_overlapping_runs_of_the_same_command_separate() {
     .expect("operations log");
     let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["history", "--json"])
-        .env("HOME", home.path())
+        .isolated_home(home.path())
         .env("XDG_STATE_HOME", &state)
         .output()
         .expect("run history");
@@ -150,6 +152,27 @@ fn history_text_escapes_controls_while_json_preserves_paths_and_summaries() {
     assert_eq!(value["sessions"][1]["malformed_summaries"], 1);
     assert_eq!(value["deletions"][0]["path"], unusual_path);
     assert_eq!(value["deletions"][0]["status"], "dry-run");
+}
+
+#[test]
+fn history_text_keeps_explicit_utc_timestamps() {
+    let home = tempdir().expect("temporary home");
+    let state = home.path().join("state");
+    let directory = state.join("mole-linux");
+    fs::create_dir_all(&directory).expect("state directory");
+    fs::write(
+        directory.join("operations.log"),
+        concat!(
+            "# ========== clean session started at 2026-10-19T00:07:00Z ==========\n",
+            "# ========== clean session ended at 2026-10-19T00:07:01Z, 0 items, 0B ==========\n"
+        ),
+    )
+    .expect("operations log");
+    let output = run_history_at(home.path(), &state, &[]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("history output");
+    assert!(text.contains("2026-10-19T00:07:00Z"), "{text}");
+    assert!(text.contains("2026-10-19T00:07:01Z"), "{text}");
 }
 
 fn encode_test_field(value: &str) -> String {
@@ -297,9 +320,9 @@ fn an_unended_identified_run_closes_at_its_next_start_marker() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON output");
     let sessions = value["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 2);
-    assert_eq!(sessions[0]["ended_at"], "2026-10-19 10:00:04");
+    assert_eq!(sessions[0]["ended_at"], "2026-10-19T10:00:04Z");
     assert_eq!(sessions[0]["actions"]["trashed"], 1);
-    assert_eq!(sessions[1]["ended_at"], "2026-10-19 10:00:02");
+    assert_eq!(sessions[1]["ended_at"], "2026-10-19T10:00:02Z");
     assert_eq!(sessions[1]["actions"]["removed"], 1);
 }
 

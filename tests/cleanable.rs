@@ -1,6 +1,9 @@
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::process::Command;
+#[path = "support/home.rs"]
+mod home_support;
+use home_support::CommandHomeExt;
 
 const SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 
@@ -105,6 +108,7 @@ fn analyze_json_marks_directory_hints_without_marking_files() {
     let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["analyze", "--json"])
         .arg(&root)
+        .isolated_home(temp.path())
         .output()
         .expect("run analyze --json");
     assert!(

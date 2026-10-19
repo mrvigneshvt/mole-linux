@@ -3,6 +3,9 @@ mod fixtures;
 
 use std::fs;
 use std::process::Command;
+#[path = "support/home.rs"]
+mod home_support;
+use home_support::CommandHomeExt;
 
 #[test]
 fn builds_realistic_home_and_canaries_survive() {
@@ -140,4 +143,28 @@ fn fixture_contains_a_real_tracked_repo_and_untracked_worktree_content() {
         .expect("list worktrees");
     assert!(worktrees.status.success());
     assert!(String::from_utf8_lossy(&worktrees.stdout).contains("project-linked"));
+}
+
+#[test]
+fn clean_dryrun_scenario_keeps_every_honeypot_canary() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let home = temp.path().join("home");
+    let fixture = fixtures::HomeFixture::build(&home).expect("build honeypot");
+    let scenario = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/honeypot/scenarios/clean-dryrun.sh");
+    let output = Command::new("bash")
+        .arg(scenario)
+        .arg(env!("CARGO_BIN_EXE_mole-linux"))
+        .isolated_home(&home)
+        .output()
+        .expect("run clean dry-run scenario");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fixture
+        .assert_canaries_intact()
+        .expect("canaries intact after clean preview");
 }

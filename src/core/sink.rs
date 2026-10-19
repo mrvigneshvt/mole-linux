@@ -135,6 +135,10 @@ impl Identity {
     fn matches(&self, path: &Path) -> io::Result<bool> {
         Ok(self == &Self::capture(path)?)
     }
+
+    pub fn object_key(&self) -> (u64, u64) {
+        (self.device, self.inode)
+    }
 }
 
 #[derive(Debug)]

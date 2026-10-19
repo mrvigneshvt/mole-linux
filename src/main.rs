@@ -70,6 +70,8 @@ struct CliCleanArgs {
     #[arg(long)]
     dry_run: bool,
     #[arg(long)]
+    yes: bool,
+    #[arg(long)]
     categories: Option<String>,
     #[arg(long)]
     select: Option<String>,
@@ -166,7 +168,11 @@ enum Shell {
 fn main() {
     if let Err(error) = run() {
         eprintln!("mole-linux: {error}");
-        std::process::exit(2);
+        std::process::exit(if error.kind() == io::ErrorKind::Interrupted {
+            130
+        } else {
+            2
+        });
     }
 }
 
@@ -240,6 +246,7 @@ fn run() -> io::Result<()> {
         Command::Snapshots => snapshots::run(),
         Command::Clean(args) => mole_linux::commands::clean::run(CleanArgs {
             dry_run: args.dry_run,
+            yes: args.yes,
             categories: args.categories,
             select: args.select,
             exclude: args.exclude,

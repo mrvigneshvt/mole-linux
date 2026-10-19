@@ -8,7 +8,7 @@ use super::fsutil::{atomic_replace, resolve_symlink_chain};
 use super::paths::XdgPaths;
 
 /// User configured paths that must be kept by every deletion policy check.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Whitelist {
     patterns: Vec<Pattern>,
     pub warnings: Vec<WhitelistWarning>,
@@ -20,7 +20,7 @@ pub struct WhitelistWarning {
     pub reason: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Pattern {
     source: String,
     matcher: GlobMatcher,

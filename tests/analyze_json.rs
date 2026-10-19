@@ -4,6 +4,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::process::Command;
 
 use mole_linux::scan::{EntryKind, Node, NodeStatus, ScanReport};
+#[path = "support/home.rs"]
+mod home_support;
+use home_support::CommandHomeExt;
 
 #[test]
 fn analyze_json_emits_scan_model_and_preserves_non_utf8_names() {
@@ -16,6 +19,7 @@ fn analyze_json_emits_scan_model_and_preserves_non_utf8_names() {
     let output = Command::new(env!("CARGO_BIN_EXE_mole-linux"))
         .args(["analyze", "--json"])
         .arg(&root)
+        .isolated_home(temp.path())
         .output()
         .expect("run analyze --json");
 

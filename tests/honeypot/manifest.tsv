@@ -21,6 +21,14 @@ target-file	.cache/chromium/Default/Cache/mole-linux-cache-fixture
 target-file	.cache/BraveSoftware/Brave-Browser/Default/Cache/mole-linux-cache-fixture
 target-file	.cache/mozilla/firefox/x.default-release/cache2/mole-linux-cache-fixture
 dir	.cache/thumbnails
+target-file	.cache/thumbnails/old-preview.png
+dir	.local/state/honeypot-app/log
+target-file	.local/state/honeypot-app/log/old.log
+dir	.local/share/Trash/files
+dir	.local/share/Trash/info
+target-file	.local/share/Trash/files/old.txt
+dir	Downloads
+target-file	Downloads/stale.part
 dir	.cache/yay/pkg-build
 dir	.config/mole-linux/whitelist-protected
 dir	.local/share/keyrings

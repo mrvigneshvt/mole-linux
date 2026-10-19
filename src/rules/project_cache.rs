@@ -331,6 +331,7 @@ fn candidate_for(dir: &Path, root_name: &str, facts: &TreeFacts) -> Result<Candi
         apparent_size: Some(facts.apparent),
         allocated_size: Some(facts.allocated),
         reason: format!("Python bytecode cache in {root_name}"),
+        report: None,
         recovery: RecoveryMode::Regenerate,
         selected_by_default: true,
         owner_state: ProcessState::NotRunning,

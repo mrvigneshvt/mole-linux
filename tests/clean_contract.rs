@@ -40,9 +40,10 @@ impl CleanRule for TestRule {
                     apparent_size: Some(meta.len()),
                     allocated_size: Some(meta.blocks().saturating_mul(512)),
                     reason: "test rule evidence".to_owned(),
+                    report: None,
                     recovery: RecoveryMode::Trash,
                     selected_by_default: true,
-                    owner_state: ctx.check_owner(&self.owner_check),
+                    owner_state: ctx.check_owner(&self.owner_check, path),
                     owner_check: self.owner_check.clone(),
                     owner_action: None,
                 }

@@ -74,6 +74,7 @@ struct CliCleanArgs {
     yes: bool,
     #[arg(long)]
     categories: Option<String>,
+    /// Select rule IDs or categories (e.g. `trash` empties Trash (irreversible); `user` includes it)
     #[arg(long)]
     select: Option<String>,
     #[arg(long)]

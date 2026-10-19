@@ -186,8 +186,9 @@ fn run() -> io::Result<()> {
             json: false,
         }),
         (None, None) => match tui::run_menu()? {
-            Some(tui::MenuChoice::Clean) => Command::Clean(CleanArgs {
+            Some(tui::MenuChoice::Clean) => Command::Clean(CliCleanArgs {
                 dry_run: false,
+                yes: false,
                 categories: None,
                 select: None,
                 exclude: None,

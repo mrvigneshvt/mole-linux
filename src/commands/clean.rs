@@ -335,7 +335,7 @@ pub fn execute_rules_with_owner(
                 record(&mut summary, session, "skipped", &candidate.path)?;
                 continue;
             }
-            let owner_state = context.check_owner(&candidate.owner_check);
+            let owner_state = context.check_owner(&candidate.owner_check, &candidate.path);
             if owner_state != ProcessState::NotRunning {
                 let (outcome, reason) = match owner_state {
                     ProcessState::Running => ("skipped", "owner process is running"),

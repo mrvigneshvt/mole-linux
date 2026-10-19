@@ -11,6 +11,64 @@ pub enum ProcessState {
     Unknown,
 }
 
+/// Reports whether any visible process has the exact path open through procfs.
+/// An unreadable process descriptor makes a negative result unknown.
+pub fn is_path_open(proc_root: &Path, target: &Path) -> ProcessState {
+    let target = match target.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return ProcessState::Unknown,
+    };
+    let entries = match fs::read_dir(proc_root) {
+        Ok(entries) => entries,
+        Err(_) => return ProcessState::Unknown,
+    };
+    let mut unknown = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                unknown = true;
+                continue;
+            }
+        };
+        if entry
+            .file_name()
+            .to_str()
+            .is_none_or(|name| !name.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            continue;
+        }
+        let descriptors = match fs::read_dir(entry.path().join("fd")) {
+            Ok(descriptors) => descriptors,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                unknown = true;
+                continue;
+            }
+        };
+        for descriptor in descriptors {
+            let descriptor = match descriptor {
+                Ok(descriptor) => descriptor,
+                Err(_) => {
+                    unknown = true;
+                    continue;
+                }
+            };
+            match fs::read_link(descriptor.path()) {
+                Ok(path) if path == target => return ProcessState::Running,
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => unknown = true,
+            }
+        }
+    }
+    if unknown {
+        ProcessState::Unknown
+    } else {
+        ProcessState::NotRunning
+    }
+}
+
 /// Checks a process through procfs. An unreadable or malformed proc entry stays unknown.
 pub fn is_process_running(proc_root: &Path, pid: u32) -> ProcessState {
     let proc_entries = match fs::read_dir(proc_root) {

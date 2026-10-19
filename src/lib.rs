@@ -1,3 +1,4 @@
+pub mod adapters;
 pub mod cleanable;
 pub mod commands;
 pub mod core;

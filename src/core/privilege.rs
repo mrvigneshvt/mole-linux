@@ -353,7 +353,8 @@ pub fn ask_owner_consent(listing: &[Vec<OsString>]) -> bool {
     matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
 }
 
-fn is_executable_file(path: &Path) -> bool {
+/// True for a regular file (symlinks followed) with at least one execute bit.
+pub fn is_executable_file(path: &Path) -> bool {
     fs::metadata(path)
         .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)

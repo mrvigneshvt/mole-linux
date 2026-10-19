@@ -41,6 +41,14 @@ pub enum OwnerCheck {
     ProcessName(String),
 }
 
+/// An owner command that performs the cleanup of a candidate directory instead of a sink deletion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerAction {
+    pub program: PathBuf,
+    pub args: &'static [&'static str],
+    pub timeout: std::time::Duration,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Candidate {
     pub path: PathBuf,
@@ -52,6 +60,8 @@ pub struct Candidate {
     pub selected_by_default: bool,
     pub owner_state: ProcessState,
     pub owner_check: OwnerCheck,
+    /// Set for owner-managed caches: the owner command replaces the sink deletion.
+    pub owner_action: Option<OwnerAction>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -143,6 +153,7 @@ pub fn candidate(
         selected_by_default: owner_state == ProcessState::NotRunning,
         owner_state,
         owner_check: OwnerCheck::None,
+        owner_action: None,
     })
 }
 
@@ -153,5 +164,6 @@ pub fn catalog() -> Vec<Box<dyn CleanRule>> {
         super::project_cache::registered(),
     ];
     rules.extend(super::system::catalog());
+    rules.extend(super::owner_cache::registered());
     rules
 }

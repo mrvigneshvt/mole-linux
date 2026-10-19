@@ -69,3 +69,12 @@ cargo-manifest	cargo-project/Cargo.toml
 target-file	Downloads/installer.AppImage
 target-file	.local/share/Trash/files/old
 target-file	project/src/__pycache__/module.pyc
+dir	.local/share/pnpm/store/v11
+dir	.bun/install/cache
+dir	.cache/node/corepack
+target-file	.npm/_cacache/mole-linux-npm-fixture
+target-file	.local/share/pnpm/store/v11/mole-linux-pnpm-fixture
+target-file	.bun/install/cache/mole-linux-bun-fixture
+target-file	.cache/node/corepack/mole-linux-corepack-fixture
+canary	.npmrc
+canary	.cache/node/keep-canary

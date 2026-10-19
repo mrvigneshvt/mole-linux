@@ -335,5 +335,6 @@ fn candidate_for(dir: &Path, root_name: &str, facts: &TreeFacts) -> Result<Candi
         selected_by_default: true,
         owner_state: ProcessState::NotRunning,
         owner_check: OwnerCheck::None,
+        owner_action: None,
     })
 }

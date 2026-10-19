@@ -1,0 +1,24 @@
+# Maintainer: mole-linux contributors
+pkgname=mole-linux
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Linux-first system cleanup and inspection tool'
+arch=('x86_64')
+url='https://github.com/mrvigneshvt/mole-linux'
+license=('GPL-3.0-only')
+depends=('gcc-libs')
+makedepends=('cargo')
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+# Replace with the published v${pkgver} archive checksum before release or AUR submission.
+sha256sums=('SKIP')
+
+build() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    cargo build --release --locked
+}
+
+package() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    install -Dm755 target/release/mole-linux "${pkgdir}/usr/bin/mole-linux"
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

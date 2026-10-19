@@ -3,7 +3,10 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use mole_linux::core::paths::XdgPaths;
-use mole_linux::core::sink::{DeleteError, DeleteMode, Identity, delete, delete_batch};
+use mole_linux::core::sink::{
+    DeleteError, DeleteMode, Identity, SinkContext, delete, delete_batch,
+};
+use mole_linux::core::whitelist::Whitelist;
 
 fn xdg(home: &Path) -> XdgPaths {
     XdgPaths::from_values(home.to_path_buf(), None, None, None, None)
@@ -12,6 +15,12 @@ fn xdg(home: &Path) -> XdgPaths {
 
 fn identity(path: &Path) -> Identity {
     Identity::capture(path).expect("capture target identity")
+}
+
+fn context(home: &Path) -> SinkContext {
+    let xdg = xdg(home);
+    let whitelist = Whitelist::load(&xdg).expect("load empty temporary whitelist");
+    SinkContext::new(xdg, whitelist)
 }
 
 #[test]
@@ -26,8 +35,7 @@ fn dry_run_preserves_target() {
         &target,
         &identity(&target),
         DeleteMode::DryRun,
-        &home,
-        &xdg(&home),
+        &context(&home),
     );
     assert!(result.is_ok());
     assert_eq!(fs::read(&target).expect("target remains"), b"data");
@@ -45,8 +53,7 @@ fn trash_moves_item_and_writes_freedesktop_metadata() {
         &target,
         &identity(&target),
         DeleteMode::Trash,
-        &home,
-        &xdg(&home),
+        &context(&home),
     );
     let trashed_path = result.expect("trash succeeds");
     assert!(!target.exists());
@@ -76,7 +83,7 @@ fn changed_identity_is_refused() {
     let preview = identity(&target);
     fs::write(&target, "after and changed").expect("replace content");
 
-    let result = delete(&target, &preview, DeleteMode::Permanent, &home, &xdg(&home));
+    let result = delete(&target, &preview, DeleteMode::Permanent, &context(&home));
     assert!(result.is_err());
     assert_eq!(
         fs::read(&target).expect("preserved target"),
@@ -98,7 +105,7 @@ fn batch_orders_descendants_before_parents() {
         (child.clone(), identity(&child)),
     ];
 
-    let results = delete_batch(entries, DeleteMode::Trash, &home, &xdg(&home), || false);
+    let results = delete_batch(entries, DeleteMode::Trash, &context(&home), || false);
     assert!(results[0].1.is_ok(), "child should be processed first");
     assert!(
         results[1].1.is_err(),
@@ -122,8 +129,7 @@ fn trash_preserves_non_utf8_name() {
         &target,
         &identity(&target),
         DeleteMode::Trash,
-        &home,
-        &xdg(&home),
+        &context(&home),
     )
     .expect("non-UTF-8 names are valid filesystem paths");
     assert_eq!(
@@ -142,7 +148,7 @@ fn cancellation_stops_batch_before_any_mutation() {
     fs::write(&target, "data").expect("target");
     let entries = vec![(target.clone(), identity(&target))];
 
-    let results = delete_batch(entries, DeleteMode::Permanent, &home, &xdg(&home), || true);
+    let results = delete_batch(entries, DeleteMode::Permanent, &context(&home), || true);
     assert_eq!(results.len(), 1);
     assert!(matches!(
         results[0].1,
@@ -164,7 +170,7 @@ fn symlink_replacement_after_preview_is_refused() {
     fs::remove_file(&target).expect("replace target in test fixture");
     std::os::unix::fs::symlink(&outside, &target).expect("replacement symlink");
 
-    let result = delete(&target, &preview, DeleteMode::Permanent, &home, &xdg(&home));
+    let result = delete(&target, &preview, DeleteMode::Permanent, &context(&home));
     assert!(result.is_err());
     assert_eq!(fs::read(&outside).expect("outside preserved"), b"protected");
 }
@@ -182,8 +188,7 @@ fn permanent_directory_removal_is_fd_relative_and_recursive() {
         &target,
         &identity(&target),
         DeleteMode::Permanent,
-        &home,
-        &xdg(&home),
+        &context(&home),
     )
     .expect("remove tree");
     assert!(!target.exists());
@@ -204,7 +209,7 @@ fn ancestor_symlink_swap_after_preview_refuses_decoy() {
     std::os::unix::fs::symlink(home.join("decoy"), home.join("ancestor"))
         .expect("swap ancestor for symlink");
 
-    let result = delete(&target, &preview, DeleteMode::Permanent, &home, &xdg(&home));
+    let result = delete(&target, &preview, DeleteMode::Permanent, &context(&home));
     assert!(result.is_err());
     assert_eq!(
         fs::read(decoy.join("item")).expect("decoy remains"),
@@ -228,8 +233,7 @@ fn sink_rejects_ssh_key_and_git_metadata() {
             target,
             &identity(target),
             DeleteMode::Permanent,
-            &home,
-            &xdg(&home),
+            &context(&home),
         );
         assert!(
             matches!(result, Err(DeleteError::InvalidPath(_))),
@@ -259,8 +263,7 @@ fn trash_directory_symlink_hijack_refuses_without_moving_target() {
         &target,
         &identity(&target),
         DeleteMode::Trash,
-        &home,
-        &xdg(&home),
+        &context(&home),
     );
     assert!(result.is_err());
     assert_eq!(fs::read(&target).expect("source stays"), b"keep");
@@ -287,16 +290,14 @@ fn same_basename_trash_items_get_distinct_names_and_correct_metadata() {
         &first,
         &identity(&first),
         DeleteMode::Trash,
-        &home,
-        &xdg(&home),
+        &context(&home),
     )
     .expect("first trash");
     let second_trash = delete(
         &second,
         &identity(&second),
         DeleteMode::Trash,
-        &home,
-        &xdg(&home),
+        &context(&home),
     )
     .expect("second trash");
     assert_ne!(first_trash.file_name(), second_trash.file_name());
@@ -325,7 +326,7 @@ fn unreadable_parent_after_preview_refuses_delete() {
     let preview = identity(&target);
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o0)).expect("make parent unreadable");
 
-    let result = delete(&target, &preview, DeleteMode::Permanent, &home, &xdg(&home));
+    let result = delete(&target, &preview, DeleteMode::Permanent, &context(&home));
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("restore parent");
     assert!(result.is_err());
     assert_eq!(fs::read(&target).expect("target remains"), b"keep");
@@ -351,8 +352,7 @@ fn nested_unwritable_directory_returns_partial_error_without_panicking() {
         &tree,
         &identity(&tree),
         DeleteMode::Permanent,
-        &home,
-        &xdg(&home),
+        &context(&home),
     );
     fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).expect("restore permissions");
     let message = result
@@ -383,7 +383,7 @@ fn cancellation_after_first_item_marks_only_remaining_items_cancelled() {
     ];
     let mut checks = 0;
 
-    let results = delete_batch(entries, DeleteMode::Permanent, &home, &xdg(&home), || {
+    let results = delete_batch(entries, DeleteMode::Permanent, &context(&home), || {
         checks += 1;
         checks > 1
     });

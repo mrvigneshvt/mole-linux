@@ -4,5 +4,6 @@
 pub mod browser;
 pub mod clean;
 pub mod owner_cache;
+pub mod optimize;
 pub mod project_cache;
 pub mod system;

@@ -53,16 +53,24 @@ pub enum OwnerProgram {
     Journalctl,
     Flatpak,
     Coredumpctl,
+    FcCache,
+    UpdateDesktopDatabase,
+    UpdateMimeDatabase,
+    Systemctl,
 }
 
 impl OwnerProgram {
-    fn file_name(self) -> &'static str {
+    pub fn file_name(self) -> &'static str {
         match self {
             Self::Pacman => "pacman",
             Self::Paccache => "paccache",
             Self::Journalctl => "journalctl",
             Self::Flatpak => "flatpak",
             Self::Coredumpctl => "coredumpctl",
+            Self::FcCache => "fc-cache",
+            Self::UpdateDesktopDatabase => "update-desktop-database",
+            Self::UpdateMimeDatabase => "update-mime-database",
+            Self::Systemctl => "systemctl",
         }
     }
 
@@ -78,6 +86,7 @@ pub struct OwnerCommand {
     args: Vec<OsString>,
     needs_root: bool,
     no_match_exit: Option<i32>,
+    answer_exit: Option<i32>,
 }
 
 impl OwnerCommand {
@@ -91,7 +100,29 @@ impl OwnerCommand {
             args: args.into_iter().map(Into::into).collect(),
             needs_root,
             no_match_exit: None,
+            answer_exit: None,
         }
+    }
+
+    pub fn program(&self) -> OwnerProgram {
+        self.program
+    }
+
+    /// Human-readable command line for previews (never executed).
+    pub fn describe(&self) -> String {
+        let mut line = self.program.file_name().to_owned();
+        for arg in &self.args {
+            line.push(' ');
+            line.push_str(&arg.to_string_lossy());
+        }
+        line
+    }
+
+    /// Declares an exit code under which the tool's stdout is its answer (e.g.
+    /// `systemctl is-enabled` prints `disabled` and exits 1). `OwnerRunner::query` returns that stdout.
+    pub fn answer_on_exit(mut self, code: i32) -> Self {
+        self.answer_exit = Some(code);
+        self
     }
 
     /// Declares the exit code the tool uses for "nothing matched" (e.g. `pacman -Qm` → 1).
@@ -158,6 +189,10 @@ impl OwnerRunner {
             consent,
             query_timeout: QUERY_TIMEOUT,
         }
+    }
+
+    pub fn is_available(&self, program: OwnerProgram) -> bool {
+        is_executable_file(&program.path_in(&self.bin_dir))
     }
 
     pub fn with_query_timeout(mut self, timeout: Duration) -> Self {
@@ -243,7 +278,7 @@ impl OwnerRunner {
             Ok(bytes) => bytes,
             Err(reason) => return Err(failed(argv, reason)),
         };
-        if status.success() {
+        if status.success() || (cmd.answer_exit == status.code() && !stdout_bytes.is_empty()) {
             return Ok(String::from_utf8_lossy(&stdout_bytes).into_owned());
         }
         if cmd.no_match_exit == status.code() && stdout_bytes.is_empty() && stderr_bytes.is_empty()

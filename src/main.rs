@@ -271,7 +271,9 @@ fn run() -> io::Result<()> {
                 not_implemented("uninstall", 36)
             }
         }
-        Command::Optimize(_) => not_implemented("optimize", 39),
+        Command::Optimize(args) => {
+            mole_linux::commands::optimize::run(args.dry_run, args.whitelist)
+        }
         Command::History(args) => mole_linux::core::oplog::run(args.json, args.limit),
         Command::Completion(args) => run_completion(args),
     }

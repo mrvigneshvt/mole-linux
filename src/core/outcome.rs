@@ -10,6 +10,33 @@ pub enum Outcome {
     Failed,
 }
 
+impl Outcome {
+    /// The operation-log vocabulary (`core::oplog::OUTCOME_NAMES`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Unchanged => "unchanged",
+            Self::Skipped => "skipped",
+            Self::Unavailable => "unavailable",
+            Self::Attention => "attention",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// One task-level outcome from sub-operation counts: failure wins, then change, then skip.
+    pub fn from_counts(applied: u64, failed: u64, skipped: u64) -> Self {
+        if failed > 0 {
+            Self::Failed
+        } else if applied > 0 {
+            Self::Applied
+        } else if skipped > 0 {
+            Self::Skipped
+        } else {
+            Self::Unchanged
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OutcomeError {
     TaskAlreadyActive,
@@ -54,16 +81,7 @@ impl OutcomeLedger {
         failed: u64,
         skipped: u64,
     ) -> Result<(), OutcomeError> {
-        let outcome = if failed > 0 {
-            Outcome::Failed
-        } else if applied > 0 {
-            Outcome::Applied
-        } else if skipped > 0 {
-            Outcome::Skipped
-        } else {
-            Outcome::Unchanged
-        };
-        self.report(outcome)
+        self.report(Outcome::from_counts(applied, failed, skipped))
     }
 
     pub fn finish(&mut self, action: &str) -> Result<(), OutcomeError> {

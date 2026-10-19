@@ -91,7 +91,7 @@ fn context<'a>(
 const TWO_CANDIDATES: &str = "==> finished dry run: 2 candidates (disk space saved: 8 MiB)";
 
 #[test]
-fn owner_probe_returns_stdout_for_unprivileged_queries_without_sudo() {
+fn owner_query_returns_stdout_for_unprivileged_queries_without_sudo() {
     let temp = tempfile::tempdir().expect("tempdir");
     let bin = temp.path().join("usr-bin");
     let log = temp.path().join("calls.log");
@@ -99,7 +99,7 @@ fn owner_probe_returns_stdout_for_unprivileged_queries_without_sudo() {
     let runner = OwnerRunner::new(bin, temp.path().join("no-sudo"), Consent::Unasked);
     let query = OwnerCommand::new(OwnerProgram::Paccache, ["-dk3"], false);
 
-    let output = runner.probe(&query).expect("probe succeeds");
+    let output = runner.query(&query).expect("query succeeds");
 
     assert!(
         output.contains("finished dry run: 2 candidates"),
@@ -109,7 +109,7 @@ fn owner_probe_returns_stdout_for_unprivileged_queries_without_sudo() {
 }
 
 #[test]
-fn owner_probe_refuses_root_commands_and_missing_tools() {
+fn owner_query_refuses_root_commands_and_missing_tools() {
     let temp = tempfile::tempdir().expect("tempdir");
     let bin = temp.path().join("usr-bin");
     let log = temp.path().join("calls.log");
@@ -118,8 +118,10 @@ fn owner_probe_refuses_root_commands_and_missing_tools() {
     let runner = OwnerRunner::new(bin.clone(), sudo, Consent::Granted);
 
     let root = runner
-        .probe(&OwnerCommand::new(OwnerProgram::Paccache, ["-dk3"], true))
-        .expect_err("probes never run as root");
+        .query(&OwnerCommand::new(OwnerProgram::Paccache, ["-dk3"], true))
+        .expect_err("queries never run as root")
+        .reason
+        .unwrap_or_default();
     assert!(root.contains("sudo"), "{root}");
 
     let missing = OwnerRunner::new(
@@ -127,10 +129,12 @@ fn owner_probe_refuses_root_commands_and_missing_tools() {
         temp.path().join("no-sudo"),
         Consent::Unasked,
     )
-    .probe(&OwnerCommand::new(OwnerProgram::Paccache, ["-dk3"], false))
-    .expect_err("missing tool is an error");
+    .query(&OwnerCommand::new(OwnerProgram::Paccache, ["-dk3"], false))
+    .expect_err("missing tool is an error")
+    .reason
+    .unwrap_or_default();
     assert!(missing.contains("missing"), "{missing}");
-    assert!(read_log(&log).is_empty(), "refused probes execute nothing");
+    assert!(read_log(&log).is_empty(), "refused queries execute nothing");
 }
 
 #[test]

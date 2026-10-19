@@ -264,7 +264,13 @@ fn run() -> io::Result<()> {
             args.hidden,
             args.r#type.as_deref(),
         ),
-        Command::Uninstall(_) => not_implemented("uninstall", 34),
+        Command::Uninstall(args) => {
+            if args.list {
+                mole_linux::commands::uninstall::run_list()
+            } else {
+                not_implemented("uninstall", 36)
+            }
+        }
         Command::Optimize(_) => not_implemented("optimize", 39),
         Command::History(args) => mole_linux::core::oplog::run(args.json, args.limit),
         Command::Completion(args) => run_completion(args),

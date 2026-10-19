@@ -66,9 +66,14 @@ impl CleanRule for PaccacheRule {
 
     fn discover_with_owner(&self, ctx: &RuleContext<'_>, owner: &OwnerRunner) -> Discovery {
         let query = OwnerCommand::new(OwnerProgram::Paccache, self.preview.iter().copied(), false);
-        let output = match owner.probe(&query) {
+        let output = match owner.query(&query) {
             Ok(output) => output,
-            Err(reason) => return unavailable(&reason),
+            Err(run) => {
+                return unavailable(
+                    &run.reason
+                        .unwrap_or_else(|| "owner query failed".to_owned()),
+                );
+            }
         };
         let Some(count) = parse_dry_run(&output) else {
             return unavailable("unrecognized paccache preview output");

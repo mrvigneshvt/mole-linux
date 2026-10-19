@@ -92,6 +92,10 @@ pub trait CleanRule: Send + Sync {
     fn id(&self) -> &str;
     fn category(&self) -> Category;
     fn discover(&self, ctx: &RuleContext<'_>) -> Discovery;
+    /// Re-checks a candidate just before the sink; `Err` keeps it and gives the reason.
+    fn final_guard(&self, _candidate: &Candidate, _ctx: &RuleContext<'_>) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Owner-dependent rules must preserve `Unknown`; it cannot authorize cleanup.

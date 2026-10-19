@@ -279,7 +279,7 @@ pub fn execute_rules(
         }
     } else {
         let mut sized_objects = BTreeSet::new();
-        for (_, candidate) in apply {
+        for (rule_id, candidate) in apply {
             if context.cancel.load(Ordering::Relaxed) {
                 summary.cancelled = true;
                 record(&mut summary, session, "skipped", &candidate.path)?;
@@ -294,6 +294,15 @@ pub fn execute_rules(
                 };
                 record(&mut summary, session, outcome, &candidate.path)?;
                 println!("{}: {}", display_path(&candidate.path), reason);
+                continue;
+            }
+            if let Some(reason) = final_guard_refusal(rules, &rule_id, &candidate, context) {
+                record(&mut summary, session, "skipped", &candidate.path)?;
+                println!(
+                    "{}: {}",
+                    display_path(&candidate.path),
+                    escape_text(&reason)
+                );
                 continue;
             }
             let mode = match candidate.recovery {
@@ -334,6 +343,17 @@ pub fn execute_rules(
         }
     }
     Ok(summary)
+}
+
+/// The owning rule re-checks a candidate right before the sink; `Some` keeps it.
+fn final_guard_refusal(
+    rules: &[&dyn CleanRule],
+    rule_id: &str,
+    candidate: &Candidate,
+    context: &RuleContext<'_>,
+) -> Option<String> {
+    let rule = rules.iter().find(|rule| rule.id() == rule_id)?;
+    rule.final_guard(candidate, context).err()
 }
 
 fn protected_reason(candidate: &Candidate, context: &RuleContext<'_>) -> Option<String> {

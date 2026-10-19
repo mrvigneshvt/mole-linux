@@ -31,22 +31,32 @@ write_shim pnpm 'case "$*" in
   --version) echo 11.17.0 ;;
   "store path") echo "$HOME/.local/share/pnpm/store/v11" ;;
 esac'
+# bun fails `pm cache` here as it does on the reference host (no package.json in cwd),
+# so its cache is offered through the sink fallback instead of the owner command.
 write_shim bun 'case "$*" in
   --version) echo 1.4.2 ;;
-  "pm cache") echo "$HOME/.bun/install/cache" ;;
+  "pm cache") exit 1 ;;
 esac'
 write_shim corepack 'case "$*" in
   --version) echo 0.34.0 ;;
 esac'
 
+# The seeded HOME already has one Trash entry; compare against this baseline.
+trash_before=$(find "$HOME/.local/share/Trash/files" -mindepth 1 -maxdepth 1 | wc -l)
 output=$(PATH="$bin:/usr/bin:/bin" /usr/local/bin/mole-linux clean --dry-run --select npm,pnpm,bun,corepack)
 printf '%s\n' "$output"
 
 selected=$(grep -c 'Selected \[development\]' <<< "$output" || true)
 [[ "$selected" -eq 4 ]] || fail "expected 4 selected owner caches, got $selected"
-for command in 'npm cache clean --force' 'pnpm store prune' 'bun pm cache rm' 'corepack cache clean'; do
+for command in 'npm cache clean --force' 'pnpm store prune' 'corepack cache clean'; do
     grep -Fq "owner \`$command\`" <<< "$output" || fail "missing owner command in preview: $command"
 done
+grep -Fq 'sink fallback to Trash' <<< "$output" || fail "bun was not offered through the sink fallback"
+grep -Fq "$HOME/.bun/install/cache" <<< "$output" || fail "bun fallback did not name its cache directory"
+[[ -f "$HOME/.bun/install/cache/mole-linux-bun-fixture" ]] || fail "dry run removed the bun cache"
+trash_after=$(find "$HOME/.local/share/Trash/files" -mindepth 1 -maxdepth 1 | wc -l)
+[[ "$trash_after" -eq "$trash_before" ]] || fail "dry run moved something to Trash"
+
 
 if grep -Eq $'\t(clean|prune|rm)(\t|$)' "$log"; then
     cat "$log" >&2

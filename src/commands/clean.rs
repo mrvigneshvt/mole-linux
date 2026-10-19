@@ -730,22 +730,29 @@ fn format_size(size: Option<u64>) -> String {
     size.map_or_else(|| "unknown".to_owned(), |bytes| format!("{bytes} bytes"))
 }
 
+/// Display form of a path: UTF-8 is kept, controls and invalid bytes are escaped.
 fn display_path(path: &Path) -> String {
-    path.as_os_str()
-        .as_encoded_bytes()
-        .iter()
-        .map(|byte| {
-            if *byte < 0x20 || *byte == 0x7f {
-                format!("\\x{byte:02x}")
-            } else {
-                char::from(*byte).to_string()
-            }
-        })
-        .collect()
+    let mut display = String::new();
+    for chunk in path.as_os_str().as_encoded_bytes().utf8_chunks() {
+        display.push_str(&escape_text(chunk.valid()));
+        for byte in chunk.invalid() {
+            display.push_str(&format!("\\x{byte:02x}"));
+        }
+    }
+    display
 }
 
+/// Escapes only control characters (C0, DEL, C1); printable Unicode such as `·` or `é` is kept.
 fn escape_text(value: &str) -> String {
-    value.chars().flat_map(char::escape_default).collect()
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 fn install_signal_handlers() -> io::Result<()> {
@@ -767,7 +774,28 @@ fn install_signal_handlers() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
     use std::time::Duration;
+
+    #[test]
+    fn escape_text_keeps_printable_unicode_and_escapes_only_controls() {
+        assert_eq!(escape_text("npm cache · owner"), "npm cache · owner");
+        assert_eq!(escape_text("café 日本"), "café 日本");
+        assert_eq!(
+            escape_text("a\u{1b}[0m\u{9b}\u{7f}b\n"),
+            "a\\u{1b}[0m\\u{9b}\\u{7f}b\\n"
+        );
+    }
+
+    #[test]
+    fn display_path_keeps_utf8_and_escapes_controls_and_invalid_bytes() {
+        assert_eq!(
+            display_path(Path::new("/home/x/caché·\u{1}")),
+            "/home/x/caché·\\u{1}"
+        );
+        let invalid = std::ffi::OsStr::from_bytes(b"/home/x/bad\xff.cache");
+        assert_eq!(display_path(Path::new(invalid)), "/home/x/bad\\xff.cache");
+    }
 
     #[test]
     fn comma_filter_trims_and_ignores_empty_parts() {

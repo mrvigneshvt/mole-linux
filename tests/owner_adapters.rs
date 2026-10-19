@@ -85,6 +85,8 @@ impl Sandbox {
             query_timeout: QUERY,
             clean_timeout: CLEAN,
             corepack_home: None,
+            bun_install_cache_dir: None,
+            bun_install: None,
         }
     }
 

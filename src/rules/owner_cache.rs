@@ -19,17 +19,33 @@ use super::clean::{
 
 pub struct OwnerCacheRule {
     adapter: Box<dyn OwnerAdapter>,
-    path: OsString,
-    proc_root: PathBuf,
-    corepack_home: Option<OsString>,
+    env: OwnerRuleEnv,
 }
 
-/// One rule per owner tool, using the given PATH, process root, and COREPACK_HOME.
-pub fn registered_with(
-    path: OsString,
-    proc_root: PathBuf,
-    corepack_home: Option<OsString>,
-) -> Vec<Box<dyn CleanRule>> {
+/// What the owner rules read from the process: PATH, /proc, and the tool environment variables.
+#[derive(Clone, Debug, Default)]
+pub struct OwnerRuleEnv {
+    pub path: OsString,
+    pub proc_root: PathBuf,
+    pub corepack_home: Option<OsString>,
+    pub bun_install_cache_dir: Option<OsString>,
+    pub bun_install: Option<OsString>,
+}
+
+impl OwnerRuleEnv {
+    pub fn from_process() -> Self {
+        Self {
+            path: env::var_os("PATH").unwrap_or_default(),
+            proc_root: PathBuf::from("/proc"),
+            corepack_home: env::var_os("COREPACK_HOME"),
+            bun_install_cache_dir: env::var_os("BUN_INSTALL_CACHE_DIR"),
+            bun_install: env::var_os("BUN_INSTALL"),
+        }
+    }
+}
+
+/// One rule per owner tool, using the given environment.
+pub fn registered_with(env: OwnerRuleEnv) -> Vec<Box<dyn CleanRule>> {
     let adapters: Vec<Box<dyn OwnerAdapter>> = vec![
         Box::new(Npm),
         Box::new(Pnpm),
@@ -41,32 +57,28 @@ pub fn registered_with(
         .map(|adapter| {
             Box::new(OwnerCacheRule {
                 adapter,
-                path: path.clone(),
-                proc_root: proc_root.clone(),
-                corepack_home: corepack_home.clone(),
+                env: env.clone(),
             }) as Box<dyn CleanRule>
         })
         .collect()
 }
 
-/// The owner rules for this process: real PATH, /proc, and COREPACK_HOME.
+/// The owner rules for this process.
 pub fn registered() -> Vec<Box<dyn CleanRule>> {
-    registered_with(
-        env::var_os("PATH").unwrap_or_default(),
-        PathBuf::from("/proc"),
-        env::var_os("COREPACK_HOME"),
-    )
+    registered_with(OwnerRuleEnv::from_process())
 }
 
 impl OwnerCacheRule {
     fn env(&self, home: &Path) -> AdapterEnv {
         AdapterEnv {
             home: home.to_path_buf(),
-            path: self.path.clone(),
-            proc_root: self.proc_root.clone(),
+            path: self.env.path.clone(),
+            proc_root: self.env.proc_root.clone(),
             query_timeout: crate::adapters::QUERY_TIMEOUT,
             clean_timeout: crate::adapters::CLEAN_TIMEOUT,
-            corepack_home: self.corepack_home.clone(),
+            corepack_home: self.env.corepack_home.clone(),
+            bun_install_cache_dir: self.env.bun_install_cache_dir.clone(),
+            bun_install: self.env.bun_install.clone(),
         }
     }
 
@@ -106,10 +118,12 @@ impl CleanRule for OwnerCacheRule {
         let mut candidates = Vec::new();
         let mut issues = Vec::new();
         let mut seen = BTreeSet::new();
+        let mut owner_refused = false;
         for result in results {
             let resolved = match result {
                 Ok(resolved) => resolved,
                 Err(refusal) => {
+                    owner_refused = true;
                     issues.push(refusal.reason);
                     continue;
                 }
@@ -137,6 +151,24 @@ impl CleanRule for OwnerCacheRule {
                 Err(error) => issues.push(format!("{}: {error}", resolved.target.display())),
             }
         }
+        // An owner that is installed and idle but cannot run its cache command falls back to
+        // its cache directory, removed through the sink (Trash), as the owner would have done.
+        if owner_refused && let Some(dir) = self.adapter.fallback_dir(&env) {
+            let reason = format!(
+                "{} · owner cannot run; sink fallback to Trash",
+                self.adapter.label()
+            );
+            match candidate(
+                &dir,
+                reason,
+                RecoveryMode::Regenerate,
+                ProcessState::NotRunning,
+            ) {
+                Ok(item) => candidates.push(item),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => issues.push(format!("{}: {error}", dir.display())),
+            }
+        }
         // Refusals with nothing to offer mean the owner cannot be used, not that discovery is partial.
         if candidates.is_empty() && !issues.is_empty() {
             return Discovery {
@@ -154,7 +186,7 @@ impl CleanRule for OwnerCacheRule {
 
     /// The owner may have started between discovery and the owner command; refuse then.
     fn final_guard(&self, _candidate: &Candidate, _ctx: &RuleContext<'_>) -> Result<(), String> {
-        match proc::is_command_running(&self.proc_root, self.adapter.busy_names()) {
+        match proc::is_command_running(&self.env.proc_root, self.adapter.busy_names()) {
             ProcessState::NotRunning => Ok(()),
             ProcessState::Running => Err(format!(
                 "{} started after discovery",

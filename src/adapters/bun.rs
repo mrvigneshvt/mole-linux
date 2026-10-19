@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{AdapterEnv, OwnerAdapter, Refusal, query_text, validated_absolute};
+use super::{AdapterEnv, OwnerAdapter, Refusal, absolute_env, query_text, validated_absolute};
 use crate::core::outcome::Outcome;
 
 pub struct Bun;
@@ -31,6 +31,16 @@ impl OwnerAdapter for Bun {
             outcome: Outcome::Unavailable,
             reason: "bun pm cache did not print an absolute path".to_owned(),
         })
+    }
+
+    /// Bun's cache directory, resolved as bun does: BUN_INSTALL_CACHE_DIR, then BUN_INSTALL/install/cache,
+    /// then ~/.bun/install/cache. A relative or invalid value is ignored, as bun would not use it.
+    fn fallback_dir(&self, env: &AdapterEnv) -> Option<PathBuf> {
+        absolute_env(env.bun_install_cache_dir.as_ref())
+            .or_else(|| {
+                absolute_env(env.bun_install.as_ref()).map(|root| root.join("install/cache"))
+            })
+            .or_else(|| Some(env.home.join(".bun/install/cache")))
     }
 
     fn clean_args(&self) -> &'static [&'static str] {

@@ -47,6 +47,8 @@ pub struct AdapterEnv {
     pub query_timeout: Duration,
     pub clean_timeout: Duration,
     pub corepack_home: Option<OsString>,
+    pub bun_install_cache_dir: Option<OsString>,
+    pub bun_install: Option<OsString>,
 }
 
 /// A usable binary and the cache directory its owner reports.
@@ -84,6 +86,10 @@ pub trait OwnerAdapter: Send + Sync {
     fn clean_args(&self) -> &'static [&'static str];
     /// Extra fact shown with the candidate, when the owner's command does less than its size suggests.
     fn caveat(&self) -> Option<&'static str> {
+        None
+    }
+    /// Cache directory to remove through the sink when the owner cannot run at all. None means no fallback.
+    fn fallback_dir(&self, _env: &AdapterEnv) -> Option<PathBuf> {
         None
     }
 }
@@ -189,6 +195,13 @@ fn query_text(binary: &Path, args: &[&str], env: &AdapterEnv) -> Result<String, 
         });
     }
     Ok(captured.stdout.trim_end_matches(['\n', '\r']).to_owned())
+}
+
+/// `validated_absolute` for an environment value; unset, non-UTF-8, or invalid values are None.
+pub(crate) fn absolute_env(value: Option<&OsString>) -> Option<PathBuf> {
+    value
+        .and_then(|value| value.to_str())
+        .and_then(validated_absolute)
 }
 
 /// Accepts an absolute path with no control characters and at least one component.

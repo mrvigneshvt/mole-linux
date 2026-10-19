@@ -34,24 +34,29 @@ write_shim pnpm 'case "$*" in
   "store path") echo "$HOME/.local/share/pnpm/store/v11" ;;
   "store prune") rm -f "$HOME/.local/share/pnpm/store/v11/mole-linux-pnpm-fixture" ;;
 esac'
+# bun fails `pm cache` as on the reference host, so its cache goes to Trash through the sink fallback.
 write_shim bun 'case "$*" in
   --version) echo 1.4.2 ;;
-  "pm cache") echo "$HOME/.bun/install/cache" ;;
-  "pm cache rm") rm -rf "$HOME/.bun/install/cache" ;;
+  "pm cache") exit 1 ;;
 esac'
 # corepack is deliberately not installed for this scenario.
 
+# The seeded HOME already has one Trash entry; the bun cache must add exactly one.
+trash_before=$(find "$HOME/.local/share/Trash/files" -mindepth 1 -maxdepth 1 | wc -l)
 PATH="$bin:/usr/bin:/bin" /usr/local/bin/mole-linux clean --select npm,pnpm,bun,corepack --yes | tee "$HOME/js-apply.out"
 
 # The shim logs tab-separated argv. Clean commands run exactly once each; queries may repeat.
-for argv in $'npm\tcache\tclean\t--force' $'pnpm\tstore\tprune' $'bun\tpm\tcache\trm'; do
+for argv in $'npm\tcache\tclean\t--force' $'pnpm\tstore\tprune'; do
     count=$(grep -Fc "$argv" "$log" || true)
     [[ "$count" -eq 1 ]] || fail "expected exactly one owner call for: $argv (got $count)"
 done
 
 [[ ! -e "$HOME/.npm/_cacache/mole-linux-npm-fixture" ]] || fail "npm cache survived its owner clean"
 [[ ! -e "$HOME/.local/share/pnpm/store/v11/mole-linux-pnpm-fixture" ]] || fail "pnpm store survived its owner prune"
-[[ ! -e "$HOME/.bun/install/cache" ]] || fail "bun cache survived its owner rm"
+[[ ! -e "$HOME/.bun/install/cache" ]] || fail "bun cache was not moved out of place"
+trash_after=$(find "$HOME/.local/share/Trash/files" -mindepth 1 -maxdepth 1 | wc -l)
+[[ $((trash_after - trash_before)) -eq 1 ]] || fail "bun cache was not sent to Trash (Trash went $trash_before -> $trash_after)"
+grep -Fq $'bun\tpm\tcache\trm' "$log" && fail "bun ran its rm although its query failed" || true
 [[ -f "$HOME/.cache/node/corepack/mole-linux-corepack-fixture" ]] || fail "corepack cache was removed without its owner"
 grep -Fq 'Unavailable' "$HOME/js-apply.out" || grep -Fq 'unavailable' "$HOME/js-apply.out" || fail "missing corepack was not reported unavailable"
 grep -Fq 'CLEAN applied' "$HOME/.local/state/mole-linux/operations.log" || fail "oplog has no applied CLEAN row"

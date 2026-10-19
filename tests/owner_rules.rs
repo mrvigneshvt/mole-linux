@@ -15,7 +15,7 @@ use mole_linux::core::proc::ProcessState;
 use mole_linux::core::sink::SinkContext;
 use mole_linux::core::whitelist::Whitelist;
 use mole_linux::rules::clean::{Category, CleanRule, DiscoveryStatus, RuleContext, catalog};
-use mole_linux::rules::owner_cache::registered_with;
+use mole_linux::rules::owner_cache::{OwnerRuleEnv, registered_with};
 
 struct Sandbox {
     _temp: tempfile::TempDir,
@@ -24,6 +24,16 @@ struct Sandbox {
     proc_root: PathBuf,
     state: PathBuf,
     log: PathBuf,
+}
+
+impl Sandbox {
+    fn owner_env(&self) -> OwnerRuleEnv {
+        OwnerRuleEnv {
+            path: self.bin.clone().into_os_string(),
+            proc_root: self.proc_root.clone(),
+            ..OwnerRuleEnv::default()
+        }
+    }
 }
 
 fn sandbox() -> Sandbox {
@@ -96,7 +106,7 @@ fn fake_process(proc_root: &Path, pid: u32, argv: &[&str]) {
 
 /// Runs the owner rules through the shared runner with the given arguments.
 fn run(s: &Sandbox, args: CleanArgs) -> CleanSummary {
-    let rules = registered_with(s.bin.clone().into_os_string(), s.proc_root.clone(), None);
+    let rules = registered_with(s.owner_env());
     let rule_refs: Vec<&dyn CleanRule> = rules.iter().map(Box::as_ref).collect();
     let xdg = XdgPaths::from_values(s.home.clone(), None, None, None, None).expect("xdg");
     let whitelist = Whitelist::load(&xdg).expect("whitelist");
@@ -262,7 +272,7 @@ fn missing_bun_is_unavailable_and_nothing_else_runs() {
 }
 
 #[test]
-fn bun_query_failure_is_unavailable_and_skips_the_rm() {
+fn bun_query_failure_never_runs_the_owner_rm() {
     let s = sandbox();
     seed_cache(&s.home.join(".bun/install/cache"));
     write_shim(
@@ -273,9 +283,7 @@ fn bun_query_failure_is_unavailable_and_skips_the_rm() {
         &s.log,
         "case \"$*\" in 'pm cache') exit 1;; esac",
     );
-    let summary = run(&s, select("bun"));
-    assert_eq!(summary.applied, 0, "{summary:?}");
-    assert_eq!(summary.unavailable, 1, "{summary:?}");
+    let _ = run(&s, select("bun"));
     assert!(owner_calls(&s, "rm").is_empty(), "{:?}", calls(&s));
 }
 
@@ -367,7 +375,7 @@ fn owner_gating_is_rechecked_before_the_owner_command() {
         &s.log,
         "case \"$*\" in 'config get cache') echo \"$HOME/.npm\";; esac",
     );
-    let rules = registered_with(s.bin.clone().into_os_string(), s.proc_root.clone(), None);
+    let rules = registered_with(s.owner_env());
     let rule = rules
         .iter()
         .find(|rule| rule.id() == "npm")
@@ -394,4 +402,140 @@ fn owner_gating_is_rechecked_before_the_owner_command() {
     // npm starts between discovery and the owner command: the final guard must refuse it.
     fake_process(&s.proc_root, 5150, &["npm", "ci"]);
     assert!(rule.final_guard(&candidate, &context).is_err());
+}
+
+/// Discovers one owner rule directly, for checks on what it offers before any apply.
+fn discover_with(s: &Sandbox, env: OwnerRuleEnv, id: &str) -> mole_linux::rules::clean::Discovery {
+    let rules = registered_with(env);
+    let rule = rules.iter().find(|rule| rule.id() == id).expect("rule");
+    let xdg = XdgPaths::from_values(s.home.clone(), None, None, None, None).expect("xdg");
+    let whitelist = Whitelist::load(&xdg).expect("whitelist");
+    let probe = |_: &str| ProcessState::NotRunning;
+    let cancel = AtomicBool::new(false);
+    let context = RuleContext {
+        home: &s.home,
+        xdg: &xdg,
+        whitelist: &whitelist,
+        proc_probe: &probe,
+        now: SystemTime::now(),
+        cancel: &cancel,
+    };
+    rule.discover(&context)
+}
+
+#[test]
+fn bun_that_cannot_run_falls_back_to_its_cache_dir_sent_to_trash() {
+    let s = sandbox();
+    let cache = s.home.join(".bun/install/cache");
+    seed_cache(&cache);
+    write_shim(
+        &s.home,
+        &s.bin,
+        "bun",
+        "bun",
+        &s.log,
+        "case \"$*\" in 'pm cache') exit 1;; esac",
+    );
+    let summary = run(&s, select("bun"));
+    assert_eq!(summary.applied, 1, "{summary:?}");
+    assert!(
+        !cache.exists(),
+        "the fallback must move the cache out of place"
+    );
+    let trashed = fs::read_dir(s.home.join(".local/share/Trash/files"))
+        .expect("trash files dir")
+        .count();
+    assert_eq!(trashed, 1, "the cache must be in Trash, not deleted");
+    assert!(
+        calls_of(&s, "bun").iter().all(|c| !c.contains("rm")),
+        "{:?}",
+        calls(&s)
+    );
+}
+
+#[test]
+fn bun_fallback_dry_run_selects_without_moving_anything() {
+    let s = sandbox();
+    let cache = s.home.join(".bun/install/cache");
+    seed_cache(&cache);
+    write_shim(
+        &s.home,
+        &s.bin,
+        "bun",
+        "bun",
+        &s.log,
+        "case \"$*\" in 'pm cache') exit 1;; esac",
+    );
+    let summary = run(
+        &s,
+        CleanArgs {
+            dry_run: true,
+            select: Some("bun".to_owned()),
+            ..CleanArgs::default()
+        },
+    );
+    assert_eq!(summary.unchanged, 1, "{summary:?}");
+    assert!(cache.join("entry").exists());
+}
+
+#[test]
+fn bun_fallback_is_not_offered_while_bun_runs() {
+    let s = sandbox();
+    let cache = s.home.join(".bun/install/cache");
+    seed_cache(&cache);
+    write_shim(
+        &s.home,
+        &s.bin,
+        "bun",
+        "bun",
+        &s.log,
+        "case \"$*\" in 'pm cache') exit 1;; esac",
+    );
+    fake_process(&s.proc_root, 9001, &["bun", "install"]);
+    let summary = run(&s, select("bun"));
+    assert_eq!(summary.applied, 0, "{summary:?}");
+    assert!(
+        cache.join("entry").exists(),
+        "a running bun's cache must not move"
+    );
+}
+
+#[test]
+fn bun_fallback_dir_follows_bun_install_cache_dir_then_bun_install() {
+    let s = sandbox();
+    write_shim(
+        &s.home,
+        &s.bin,
+        "bun",
+        "bun",
+        &s.log,
+        "case \"$*\" in 'pm cache') exit 1;; esac",
+    );
+    let custom = s.home.join("custom-bun-cache");
+    seed_cache(&custom);
+
+    let mut env = s.owner_env();
+    env.bun_install_cache_dir = Some(custom.clone().into_os_string());
+    env.bun_install = Some(s.home.join("bunroot").into_os_string());
+    let discovery = discover_with(&s, env, "bun");
+    assert_eq!(discovery.candidates[0].path, custom, "{discovery:?}");
+
+    let mut env = s.owner_env();
+    env.bun_install = Some(s.home.join("bunroot").into_os_string());
+    let discovery = discover_with(&s, env, "bun");
+    assert!(
+        discovery.candidates.is_empty(),
+        "no bunroot cache yet: {discovery:?}"
+    );
+
+    let mut env = s.owner_env();
+    env.bun_install_cache_dir = Some("relative/cache".into());
+    env.bun_install = Some(s.home.join("bunroot").into_os_string());
+    seed_cache(&s.home.join("bunroot/install/cache"));
+    let discovery = discover_with(&s, env, "bun");
+    assert_eq!(
+        discovery.candidates[0].path,
+        s.home.join("bunroot/install/cache"),
+        "a relative BUN_INSTALL_CACHE_DIR is ignored: {discovery:?}"
+    );
 }

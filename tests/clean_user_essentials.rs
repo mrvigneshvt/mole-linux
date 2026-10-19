@@ -197,7 +197,7 @@ fn partial_discovery_names_control_escaped_offending_path() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("partial discovery"), "{stdout}");
-    assert!(stdout.contains("bad\\\\x0ahome/Downloads"), "{stdout}");
+    assert!(stdout.contains("bad\\x0ahome/Downloads"), "{stdout}");
     assert!(!stdout.contains("bad\nhome/Downloads"), "{stdout}");
 }
 

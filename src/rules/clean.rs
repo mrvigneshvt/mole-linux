@@ -35,6 +35,8 @@ pub enum RecoveryMode {
     Trash,
     OwnerNative,
     Irreversible,
+    /// Shown as `attention` in every run; never deleted or sent to an owner tool.
+    ReportOnly,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -285,10 +287,12 @@ impl CleanRule for CoredumpReportRule {
             };
         };
         let size = readable_tree_size(Path::new(ROOT));
+        // ponytail: anchored to HOME because `candidate` needs an existing path for Identity; the
+        // report never touches it. Upgrade: anchor to ROOT once a missing dir is reported as its own state.
         let Ok(mut value) = candidate(
             ctx.home,
             REASON,
-            RecoveryMode::OwnerNative,
+            RecoveryMode::ReportOnly,
             ProcessState::NotRunning,
         ) else {
             return Discovery {

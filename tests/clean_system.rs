@@ -609,6 +609,7 @@ fn system_catalog_registers_pacman_and_aur_rules_in_the_system_category() {
     assert_eq!(
         system,
         vec![
+            "coredumps",
             "pacman-cache-keep3",
             "pacman-cache-uninstalled",
             "orphan-packages",

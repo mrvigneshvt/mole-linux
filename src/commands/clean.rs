@@ -237,7 +237,7 @@ pub fn execute_rules_with_owner(
 
     let mut apply = Vec::new();
     for (rule_id, mut candidate) in candidates {
-        if candidate.recovery == crate::rules::clean::RecoveryMode::OwnerNative {
+        if candidate.recovery == crate::rules::clean::RecoveryMode::ReportOnly {
             summary.attention = summary.attention.saturating_add(1);
             println!(
                 "Attention: {} · {}",
@@ -391,6 +391,8 @@ pub fn execute_rules_with_owner(
                 continue;
             }
             let mode = match candidate.recovery {
+                // Report-only items return before measurement, so they never reach this match.
+                RecoveryMode::ReportOnly => continue,
                 RecoveryMode::OwnerNative => {
                     let run = match owner_command_for(rules, &rule_id, &candidate) {
                         Some(command) => owner.run(&command, RunMode::Apply, || prompt(&listing)),
@@ -568,12 +570,12 @@ fn deduplicate_candidates(candidates: &mut Vec<(String, Candidate)>) {
     candidates.sort_by_key(|(_, candidate)| candidate.path.components().count());
     let mut accepted: Vec<(String, Candidate)> = Vec::new();
     for entry in candidates.drain(..) {
-        // Owner actions share a cache directory but are distinct commands, so they never collapse.
-        let owner_native = entry.1.recovery == RecoveryMode::OwnerNative;
-        if !owner_native
+        // Owner actions share a cache directory but are distinct commands, and report-only items
+        // are anchored to a path that is not their target, so neither collapses or absorbs others.
+        let independent = never_collapses(&entry.1);
+        if !independent
             && accepted.iter().any(|(_, existing)| {
-                existing.recovery != RecoveryMode::OwnerNative
-                    && entry.1.path.starts_with(&existing.path)
+                !never_collapses(existing) && entry.1.path.starts_with(&existing.path)
             })
         {
             continue;
@@ -581,6 +583,13 @@ fn deduplicate_candidates(candidates: &mut Vec<(String, Candidate)>) {
         accepted.push(entry);
     }
     *candidates = accepted;
+}
+
+fn never_collapses(candidate: &Candidate) -> bool {
+    matches!(
+        candidate.recovery,
+        RecoveryMode::OwnerNative | RecoveryMode::ReportOnly
+    )
 }
 
 fn owner_command_for(

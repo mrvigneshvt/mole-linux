@@ -286,10 +286,58 @@ mod tests {
         assert!(rendered.contains("Top 20 large files"));
         assert!(rendered.contains("large.bin"));
         assert!(rendered.contains("unknown.bin"));
-        assert!(rendered.contains("Filter:"));
+        assert!(rendered.contains("Search:"));
+        app.large_files.push_filter("zebra");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render active search query");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Search: zebra_"));
         app.large_files.move_selection(1);
         app.large_files.toggle_selected();
         assert_eq!(app.large_files.selected_count(), 0);
+    }
+
+    #[test]
+    fn test_backend_renders_menu_and_search_results() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut app = super::MenuApp::default();
+        terminal
+            .draw(|frame| super::render_menu(frame, &app))
+            .expect("render main menu");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Clean"));
+        assert!(rendered.contains("Analyze"));
+        assert!(rendered.contains("Q Quit"));
+
+        app.query.push_str("status");
+        app.searching = true;
+        terminal
+            .draw(|frame| super::render_menu(frame, &app))
+            .expect("render filtered main menu");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Search: status_"));
+        assert!(rendered.contains("Monitor system health"));
+        assert!(!rendered.contains("Free up disk space"));
     }
 }
 use std::cmp::Reverse;
@@ -298,6 +346,7 @@ use std::ffi::OsStr;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, atomic::AtomicBool as GlobalAtomicBool};
@@ -321,6 +370,235 @@ use crate::scan::{EntryKind, Node, NodeStatus, ScanEvent, ScanReport};
 use crate::status;
 
 static TERMINAL_ACTIVE: GlobalAtomicBool = GlobalAtomicBool::new(false);
+static MENU_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+// Ported from tw93/Mole mole:interactive_main_menu and show_main_menu (GPL-3.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuChoice {
+    Clean,
+    Uninstall,
+    Optimize,
+    Analyze,
+    Status,
+}
+
+const MENU_CHOICES: [(MenuChoice, &str, &str); 5] = [
+    (MenuChoice::Clean, "Clean", "Free up disk space"),
+    (MenuChoice::Uninstall, "Uninstall", "Remove apps completely"),
+    (
+        MenuChoice::Optimize,
+        "Optimize",
+        "Refresh caches and services",
+    ),
+    (MenuChoice::Analyze, "Analyze", "Explore disk usage"),
+    (MenuChoice::Status, "Status", "Monitor system health"),
+];
+
+#[derive(Default)]
+struct MenuApp {
+    selected: usize,
+    query: String,
+    searching: bool,
+}
+
+impl MenuApp {
+    fn visible(&self) -> Vec<usize> {
+        MENU_CHOICES
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, name, description))| {
+                let query = self.query.to_lowercase();
+                (name.to_lowercase().contains(&query)
+                    || description.to_lowercase().contains(&query))
+                .then_some(index)
+            })
+            .collect()
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let visible = self.visible();
+        if visible.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let current = visible
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        let next = if delta < 0 {
+            current.saturating_sub(1)
+        } else {
+            current
+                .saturating_add(1)
+                .min(visible.len().saturating_sub(1))
+        };
+        self.selected = visible[next];
+    }
+}
+
+fn render_menu(frame: &mut Frame<'_>, app: &MenuApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(2),
+        ])
+        .split(frame.area());
+    frame.render_widget(
+        Paragraph::new("Mole Linux")
+            .block(Block::default().borders(Borders::ALL).title("Main menu")),
+        chunks[0],
+    );
+    let visible = app.visible();
+    let items = visible
+        .iter()
+        .map(|index| {
+            let (_, name, description) = MENU_CHOICES[*index];
+            ListItem::new(format!("{name}  {description}"))
+        })
+        .collect::<Vec<_>>();
+    let selected = visible.iter().position(|index| *index == app.selected);
+    let mut state = ListState::default();
+    state.select(selected);
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Commands"))
+        .highlight_symbol("> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_stateful_widget(list, chunks[1], &mut state);
+    let footer = if !app.searching {
+        "↑/↓ move  / search  Enter select  Q Quit"
+    } else {
+        "↑/↓ move  Enter select  Esc clear  Q Quit"
+    };
+    let footer = if !app.searching {
+        footer.to_owned()
+    } else {
+        format!("Search: {}_  |  {footer}", app.query)
+    };
+    frame.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
+pub fn run_menu() -> io::Result<Option<MenuChoice>> {
+    install_panic_restore_hook();
+    let _signals = MenuSignalGuard::install()?;
+    let _terminal_guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::new(backend)?;
+    let mut app = MenuApp::default();
+    loop {
+        if MENU_SIGNAL.swap(0, Ordering::Relaxed) != 0 {
+            return Ok(None);
+        }
+        terminal.draw(|frame| render_menu(frame, &app))?;
+        match event::poll(Duration::from_millis(100)) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        if MENU_SIGNAL.swap(0, Ordering::Relaxed) != 0 {
+            return Ok(None);
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(None);
+            }
+            KeyCode::Char('q') if !app.searching && app.query.is_empty() => return Ok(None),
+            KeyCode::Esc if app.searching => {
+                app.query.clear();
+                app.searching = false;
+                app.selected = 0;
+            }
+            KeyCode::Esc if app.query.is_empty() => return Ok(None),
+            KeyCode::Esc => {
+                app.query.clear();
+                app.selected = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
+            KeyCode::Char('/') => app.searching = true,
+            KeyCode::Backspace if app.searching && !app.query.is_empty() => {
+                app.query.pop();
+                app.selected = app.visible().first().copied().unwrap_or_default();
+            }
+            KeyCode::Enter => {
+                let visible = app.visible();
+                if visible.is_empty() {
+                    continue;
+                }
+                return Ok(visible
+                    .iter()
+                    .find(|index| **index == app.selected)
+                    .and_then(|index| MENU_CHOICES.get(*index))
+                    .map(|(choice, _, _)| *choice));
+            }
+            KeyCode::Char(character) if app.searching && !character.is_control() => {
+                app.query.push(character);
+                app.selected = app.visible().first().copied().unwrap_or_default();
+            }
+            _ => {}
+        }
+    }
+}
+
+type SignalHandler = usize;
+
+struct MenuSignalGuard {
+    previous_int: SignalHandler,
+    previous_term: SignalHandler,
+}
+
+extern "C" fn record_menu_signal(signal: i32) {
+    MENU_SIGNAL.store(signal, Ordering::Relaxed);
+}
+
+unsafe extern "C" {
+    fn signal(signal: i32, handler: SignalHandler) -> SignalHandler;
+}
+
+impl MenuSignalGuard {
+    fn install() -> io::Result<Self> {
+        const SIGINT: i32 = 2;
+        const SIGTERM: i32 = 15;
+        MENU_SIGNAL.store(0, Ordering::Relaxed);
+        // The handler only stores an atomic signal number; terminal I/O stays in the event loop.
+        let handler = record_menu_signal as *const () as SignalHandler;
+        let previous_int = unsafe { signal(SIGINT, handler) };
+        if previous_int == SignalHandler::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        let previous_term = unsafe { signal(SIGTERM, handler) };
+        if previous_term == SignalHandler::MAX {
+            unsafe { signal(SIGINT, previous_int) };
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            previous_int,
+            previous_term,
+        })
+    }
+}
+
+impl Drop for MenuSignalGuard {
+    fn drop(&mut self) {
+        unsafe {
+            signal(2, self.previous_int);
+            signal(15, self.previous_term);
+        }
+        MENU_SIGNAL.store(0, Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizeMode {
@@ -898,9 +1176,10 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             ));
         }
         frame.render_stateful_widget(list, chunks[1], &mut state);
+        // Ported from tw93/Mole lib/ui/menu_paginated.sh:paginated_multi_select search prompt (GPL-3.0).
         let footer = if app.large_files.is_filtering() {
             format!(
-                "Filter: {}_  Enter apply  Esc clear",
+                "Search: {}_  Enter apply  Esc clear",
                 app.large_files.filter()
             )
         } else {

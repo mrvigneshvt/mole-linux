@@ -18,6 +18,16 @@ pub struct StatusArgs {
     interval: Duration,
 }
 
+impl StatusArgs {
+    pub fn interactive() -> Self {
+        Self {
+            json: false,
+            watch: false,
+            interval: Duration::from_secs(1),
+        }
+    }
+}
+
 pub fn run(args: StatusArgs) -> io::Result<()> {
     // Ported from tw93/Mole cmd/status/main.go and watch.go:runWatchStdout (GPL-3.0), with the Linux collector.
     let mut collector = status::Collector::system();

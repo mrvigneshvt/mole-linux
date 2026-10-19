@@ -6,7 +6,8 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use crate::scan::{EntryKind, Node, NodeStatus};
+    use crate::core::sink::DeleteError;
+    use crate::scan::{EntryKind, Node, NodeStatus, ScanReport};
 
     use super::{
         App, FilesystemStats, FilesystemType, Navigator, SizeMode, escape_name,
@@ -354,9 +355,146 @@ mod tests {
         assert!(!rendered.contains("search: sta"));
         assert!(!rendered.contains("Search: sta_"));
     }
+
+    #[test]
+    fn confirmed_delete_removes_large_file_rows_and_renders_result_and_failures() {
+        let target = PathBuf::from("/tmp/example/selected.bin");
+        let failed = PathBuf::from("/tmp/example/protected.bin");
+        let mut root = node(
+            "root",
+            EntryKind::Directory,
+            vec![
+                node("selected.bin", EntryKind::File, vec![]),
+                node("protected.bin", EntryKind::File, vec![]),
+            ],
+        );
+        root.apparent = 3072;
+        root.allocated = 3072;
+        let mut app = App::new(PathBuf::from("/tmp/example"), root, None, false);
+        app.large_files = super::LargeFilesView::from_entries(vec![
+            (target.clone(), Some(2048)),
+            (failed.clone(), Some(1024)),
+        ]);
+        let sizes = std::collections::HashMap::from([
+            (target.clone(), Some(2048)),
+            (failed.clone(), Some(1024)),
+        ]);
+
+        let refresh = app.apply_delete_results(
+            vec![
+                (target.clone(), Ok(target.clone())),
+                (failed.clone(), Err(DeleteError::Whitelisted)),
+            ],
+            &sizes,
+        );
+
+        assert!(refresh, "a successful Trash should refresh scan totals");
+        assert_eq!(app.large_files.files.entries().len(), 1);
+        assert_eq!(app.large_files.files.entries()[0].path, failed);
+        let report = app.delete_report.as_ref().expect("delete result");
+        assert_eq!(report.moved, 1);
+        assert_eq!(report.moved_bytes, Some(2048));
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].1, "protected by the whitelist");
+
+        let mut refreshed_root = node(
+            "root",
+            EntryKind::Directory,
+            vec![node("protected.bin", EntryKind::File, vec![])],
+        );
+        refreshed_root.apparent = 1024;
+        refreshed_root.allocated = 1024;
+        app.accept_report(ScanReport {
+            root: refreshed_root,
+        });
+        assert_eq!(app.navigator.current_node().apparent, 1024);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("test terminal");
+        app.show_large_files = true;
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render result");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Moved 1 item(s) to Trash (2.0 KiB apparent)."));
+        assert!(rendered.contains("Space is not freed until Trash is emptied."));
+        assert!(rendered.contains("/tmp/example/protected.bin"));
+        assert!(rendered.contains("protected by the whitelist"));
+        assert!(!rendered.contains("/tmp/example/selected.bin"));
+    }
+
+    #[test]
+    fn main_list_selection_tracks_paths_and_is_disabled_while_scanning_or_at_overview() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let base = temp.path().join("home");
+        std::fs::create_dir(&base).expect("home");
+        std::fs::write(base.join("candidate.bin"), b"candidate").expect("candidate file");
+        let root = node(
+            "root",
+            EntryKind::Directory,
+            vec![node("candidate.bin", EntryKind::File, vec![])],
+        );
+        let mut app = App::new(base.clone(), root, None, false);
+
+        app.toggle_current_selected();
+        assert!(app.main_selected.contains_key(&base.join("candidate.bin")));
+        let pending = app
+            .prepare_main_delete()
+            .expect("capture selected identity")
+            .expect("selected path pending");
+        assert_eq!(pending.entries[0].0, base.join("candidate.bin"));
+        app.scanning = true;
+        app.toggle_current_selected();
+        assert!(app.main_selected.contains_key(&base.join("candidate.bin")));
+        assert!(
+            app.prepare_main_delete()
+                .expect("scanning disables delete")
+                .is_none()
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render scanning list");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("[x] f candidate.bin"));
+        assert!(!rendered.contains("Space select"));
+
+        let mut overview_root = node("/", EntryKind::Directory, vec![]);
+        overview_root.children.push(Node {
+            name: OsString::from("Home"),
+            target_path: Some(PathBuf::from("/tmp/example")),
+            kind: EntryKind::Directory,
+            cleanable: false,
+            apparent: 4096,
+            allocated: 2048,
+            children: Vec::new(),
+            status: NodeStatus::Complete,
+        });
+        let mut overview = App::new(PathBuf::from("/"), overview_root, None, false);
+        overview.toggle_current_selected();
+        assert!(overview.main_selected.is_empty());
+        assert!(
+            overview
+                .prepare_main_delete()
+                .expect("overview disables delete")
+                .is_none()
+        );
+    }
 }
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
@@ -376,7 +514,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use rustix::fs::{statfs, statvfs};
 
@@ -797,15 +935,19 @@ impl LargeFilesView {
         self.filtering
     }
 
-    fn selected_paths(&self) -> Vec<PathBuf> {
-        let mut paths = self.selected.iter().cloned().collect::<Vec<_>>();
-        paths.sort();
-        paths
+    fn selected_sizes(&self) -> HashMap<PathBuf, Option<u64>> {
+        self.selected
+            .iter()
+            .filter_map(|path| {
+                self.files
+                    .entries
+                    .iter()
+                    .find(|entry| &entry.path == path)
+                    .map(|entry| (path.clone(), entry.size))
+            })
+            .collect()
     }
 
-    fn clear_selected(&mut self) {
-        self.selected.clear();
-    }
     fn filter(&self) -> &str {
         &self.filter
     }
@@ -961,8 +1103,23 @@ pub struct App {
     scan_failed: bool,
     large_files: LargeFilesView,
     show_large_files: bool,
-    pending_delete: Option<Vec<(PathBuf, Identity)>>,
-    delete_message: Option<String>,
+    main_selected: HashMap<PathBuf, Option<u64>>,
+    pending_delete: Option<PendingDelete>,
+    confirmation_scroll: u16,
+    delete_report: Option<DeleteReport>,
+    report_scroll: u16,
+    delete_notice: Option<String>,
+}
+
+struct PendingDelete {
+    entries: Vec<(PathBuf, Identity)>,
+    sizes: HashMap<PathBuf, Option<u64>>,
+}
+
+struct DeleteReport {
+    moved: usize,
+    moved_bytes: Option<u64>,
+    failures: Vec<(PathBuf, String)>,
 }
 
 impl App {
@@ -984,8 +1141,12 @@ impl App {
             scan_failed: false,
             large_files: LargeFilesView::default(),
             show_large_files: false,
+            main_selected: HashMap::new(),
             pending_delete: None,
-            delete_message: None,
+            confirmation_scroll: 0,
+            delete_report: None,
+            report_scroll: 0,
+            delete_notice: None,
         }
     }
 
@@ -994,6 +1155,102 @@ impl App {
             SizeMode::Allocated => SizeMode::Apparent,
             SizeMode::Apparent => SizeMode::Allocated,
         };
+    }
+
+    fn can_select_current(&self) -> bool {
+        if self.scanning || (self.overview && self.navigator.at_root()) {
+            return false;
+        }
+        self.navigator.selected_node().is_some_and(|node| {
+            matches!(node.status, NodeStatus::Complete) && !matches!(node.kind, EntryKind::Other)
+        })
+    }
+
+    fn current_selection_path(&self) -> Option<PathBuf> {
+        if !self.can_select_current() {
+            return None;
+        }
+        let node = self.navigator.selected_node()?;
+        Some(
+            node.target_path
+                .clone()
+                .unwrap_or_else(|| self.navigator.current_path(&self.path).join(&node.name)),
+        )
+    }
+
+    fn toggle_current_selected(&mut self) {
+        let Some(path) = self.current_selection_path() else {
+            return;
+        };
+        if self.main_selected.remove(&path).is_none() {
+            let size = self
+                .navigator
+                .selected_node()
+                .filter(|node| matches!(node.status, NodeStatus::Complete))
+                .map(|node| node.apparent);
+            self.main_selected.insert(path, size);
+        }
+    }
+
+    fn prepare_main_delete(&self) -> io::Result<Option<PendingDelete>> {
+        if self.scanning || (self.overview && self.navigator.at_root()) {
+            return Ok(None);
+        }
+        let mut candidates = self
+            .main_selected
+            .iter()
+            .map(|(path, size)| (path.clone(), *size))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        prepare_delete(candidates)
+    }
+
+    fn prepare_large_delete(&self) -> io::Result<Option<PendingDelete>> {
+        prepare_delete(self.large_files.selected_sizes().into_iter().collect())
+    }
+
+    fn apply_delete_results(
+        &mut self,
+        results: Vec<(PathBuf, Result<PathBuf, crate::core::sink::DeleteError>)>,
+        sizes: &HashMap<PathBuf, Option<u64>>,
+    ) -> bool {
+        let mut moved = 0_usize;
+        let mut moved_bytes = Some(0_u64);
+        let mut moved_paths = HashSet::new();
+        let mut failures = Vec::new();
+        for (path, result) in results {
+            match result {
+                Ok(_) => {
+                    moved = moved.saturating_add(1);
+                    moved_paths.insert(path.clone());
+                    moved_bytes = match (moved_bytes, sizes.get(&path).copied().flatten()) {
+                        (Some(total), Some(size)) => total.checked_add(size),
+                        _ => None,
+                    };
+                }
+                Err(error) => failures.push((path, delete_error_reason(&error))),
+            }
+        }
+        self.large_files
+            .files
+            .entries
+            .retain(|entry| !moved_paths.contains(&entry.path));
+        self.large_files
+            .selected
+            .retain(|path| !moved_paths.contains(path));
+        self.large_files.selected_index = self
+            .large_files
+            .selected_index
+            .min(self.large_files.files.entries.len().saturating_sub(1));
+        self.main_selected
+            .retain(|path, _| !moved_paths.contains(path));
+        self.delete_report = Some(DeleteReport {
+            moved,
+            moved_bytes,
+            failures,
+        });
+        self.report_scroll = 0;
+        moved > 0
     }
 
     fn accept_report(&mut self, report: ScanReport) {
@@ -1033,6 +1290,38 @@ impl App {
             }
             ScanEvent::Complete(report) => self.accept_report(report),
         }
+    }
+}
+
+fn prepare_delete(candidates: Vec<(PathBuf, Option<u64>)>) -> io::Result<Option<PendingDelete>> {
+    let mut candidates = candidates;
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut entries = Vec::with_capacity(candidates.len());
+    let mut sizes = HashMap::with_capacity(candidates.len());
+    for (path, size) in candidates {
+        let identity = Identity::capture(&path)?;
+        sizes.insert(path.clone(), size);
+        entries.push((path, identity));
+    }
+    if entries.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PendingDelete { entries, sizes }))
+    }
+}
+
+fn delete_error_reason(error: &crate::core::sink::DeleteError) -> String {
+    use crate::core::sink::DeleteError;
+    match error {
+        DeleteError::IdentityChanged => "target identity changed after preview".to_owned(),
+        DeleteError::Whitelisted => "protected by the whitelist".to_owned(),
+        DeleteError::Cancelled => "cancelled before processing".to_owned(),
+        DeleteError::InvalidPath(_) => "path rejected by deletion policy".to_owned(),
+        DeleteError::CrossFilesystemTrash => "Trash is on another filesystem".to_owned(),
+        DeleteError::MountIdUnavailable => "mount identity unavailable".to_owned(),
+        DeleteError::Partial(error)
+        | DeleteError::TrashMetadataCleanup(error)
+        | DeleteError::Io(error) => escape_name(OsStr::new(&error.to_string())),
     }
 }
 
@@ -1224,6 +1513,8 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                 "Search: {}_  Enter apply  Esc clear",
                 app.large_files.filter()
             )
+        } else if app.scanning {
+            "Scanning; selection and Trash are disabled".to_owned()
         } else {
             format!(
                 "↑/↓ move  / filter  Space select  d Trash  r refresh  Esc back{}{}",
@@ -1232,14 +1523,17 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                 } else {
                     String::new()
                 },
-                app.delete_message
+                app.delete_notice
                     .as_ref()
-                    .map_or_else(String::new, |message| format!("  {message}"))
+                    .map_or_else(String::new, |notice| format!("  {notice}"))
             )
         };
         frame.render_widget(Paragraph::new(footer), chunks[2]);
-        if let Some(entries) = &app.pending_delete {
-            render_delete_confirmation(frame, entries);
+        if let Some(pending) = &app.pending_delete {
+            render_delete_confirmation(frame, pending, app.confirmation_scroll);
+        }
+        if let Some(report) = &app.delete_report {
+            render_delete_result(frame, report, app.report_scroll);
         }
         return;
     }
@@ -1249,6 +1543,21 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         .children
         .iter()
         .map(|node| {
+            let child_path = node
+                .target_path
+                .clone()
+                .unwrap_or_else(|| app.navigator.current_path(&app.path).join(&node.name));
+            let selectable = !app.scanning
+                && !(app.overview && app.navigator.at_root())
+                && matches!(&node.status, NodeStatus::Complete)
+                && !matches!(node.kind, EntryKind::Other);
+            let selection = if app.main_selected.contains_key(&child_path) {
+                "[x] "
+            } else if selectable {
+                "[ ] "
+            } else {
+                "    "
+            };
             let percent = if matches!(
                 &node.status,
                 NodeStatus::Partial | NodeStatus::Unavailable(_)
@@ -1264,7 +1573,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             let bar = percent_bar(percent);
             let percent = percent.map_or_else(String::new, |value| format!(" {value}%"));
             ListItem::new(Line::from(format!(
-                "{} {} {} {}{}{}",
+                "{selection}{} {} {} {}{}{}",
                 kind_marker(node),
                 escape_name(&node.name),
                 size_for_node(node, app.size_mode),
@@ -1299,28 +1608,74 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         ));
     }
     frame.render_stateful_widget(list, chunks[1], &mut state);
-    frame.render_widget(
-        Paragraph::new("↑/↓ or j/k move  Enter/l descend  h/Backspace up  t large files  r refresh  a size  q quit"),
-        chunks[2],
-    );
+    let can_select = !app.scanning && !(app.overview && app.navigator.at_root());
+    let footer = if can_select {
+        format!(
+            "↑/↓ or j/k move  Space select  d Trash  Enter/l descend  h/Backspace up  t large files  r refresh  a size  q quit  {} selected{}",
+            app.main_selected.len(),
+            app.delete_notice
+                .as_ref()
+                .map_or_else(String::new, |notice| format!("  {notice}"))
+        )
+    } else {
+        "↑/↓ or j/k move  Enter/l descend  h/Backspace up  t large files  r refresh  a size  q quit"
+            .to_owned()
+    };
+    frame.render_widget(Paragraph::new(footer), chunks[2]);
+    if let Some(pending) = &app.pending_delete {
+        render_delete_confirmation(frame, pending, app.confirmation_scroll);
+    }
+    if let Some(report) = &app.delete_report {
+        render_delete_result(frame, report, app.report_scroll);
+    }
 }
 
-fn render_delete_confirmation(frame: &mut Frame<'_>, entries: &[(PathBuf, Identity)]) {
+fn render_delete_confirmation(frame: &mut Frame<'_>, pending: &PendingDelete, scroll: u16) {
     let area = centered_rect(80, 70, frame.area());
-    let paths = entries
+    let paths = pending
+        .entries
         .iter()
         .map(|(path, _)| escape_name(path.as_os_str()))
         .collect::<Vec<_>>();
     let mut lines = vec![Line::from("Trash these selected paths?")];
     lines.extend(paths.into_iter().map(Line::from));
-    lines.push(Line::from("y confirm  n/Esc cancel"));
+    lines.push(Line::from("↑/↓ scroll  y confirm  n/Esc cancel"));
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Confirm Trash"),
-        ),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Confirm Trash"),
+            ),
+        area,
+    );
+}
+
+fn render_delete_result(frame: &mut Frame<'_>, report: &DeleteReport, scroll: u16) {
+    let area = centered_rect(90, 80, frame.area());
+    let size = report
+        .moved_bytes
+        .map_or_else(|| "unknown size".to_owned(), format_size);
+    let mut lines = vec![Line::from(format!(
+        "Moved {} item(s) to Trash ({} apparent). Space is not freed until Trash is emptied.",
+        report.moved, size,
+    ))];
+    lines.extend(report.failures.iter().map(|(path, reason)| {
+        Line::from(format!(
+            "Failed: {}: {reason}",
+            escape_name(path.as_os_str())
+        ))
+    }));
+    lines.push(Line::from("↑/↓ scroll  Enter/Esc dismiss"));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .block(Block::default().borders(Borders::ALL).title("Trash result")),
         area,
     );
 }
@@ -1346,6 +1701,35 @@ fn centered_rect(
             Constraint::Percentage((100 - width_percent) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+fn restart_analyzer_scan(
+    path: &Path,
+    reports: &mut Receiver<ScanEvent>,
+    active_cancel: &mut Arc<AtomicBool>,
+    refresh_worker: &mut Option<std::thread::JoinHandle<()>>,
+    app: &mut App,
+) -> io::Result<()> {
+    active_cancel.store(true, Ordering::Relaxed);
+    if let Some(worker) = refresh_worker.take() {
+        worker
+            .join()
+            .map_err(|_| io::Error::other("refresh scanner worker panicked"))?;
+    }
+    let next_cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&next_cancel);
+    let worker_path = path.to_owned();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    *refresh_worker = Some(
+        std::thread::Builder::new()
+            .name("mole-refresh".to_owned())
+            .spawn(move || scan::scan_progressive(&worker_path, &worker_cancel, sender))?,
+    );
+    *active_cancel = next_cancel;
+    *reports = receiver;
+    app.scanning = true;
+    app.scan_failed = false;
+    Ok(())
 }
 
 pub fn run(
@@ -1394,11 +1778,28 @@ pub fn run(
                 continue;
             }
             match key.code {
+                KeyCode::Up | KeyCode::Char('k') if app.delete_report.is_some() => {
+                    app.report_scroll = app.report_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') if app.delete_report.is_some() => {
+                    app.report_scroll = app.report_scroll.saturating_add(1);
+                }
+                KeyCode::Enter | KeyCode::Esc if app.delete_report.is_some() => {
+                    app.delete_report = None;
+                }
+                _ if app.delete_report.is_some() => {}
+                KeyCode::Up | KeyCode::Char('k') if app.pending_delete.is_some() => {
+                    app.confirmation_scroll = app.confirmation_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') if app.pending_delete.is_some() => {
+                    app.confirmation_scroll = app.confirmation_scroll.saturating_add(1);
+                }
                 KeyCode::Char('y') if app.pending_delete.is_some() => {
-                    let Some(entries) = app.pending_delete.take() else {
+                    let Some(pending) = app.pending_delete.take() else {
                         continue;
                     };
-                    let paths = entries
+                    let paths = pending
+                        .entries
                         .iter()
                         .map(|(path, _)| path.clone())
                         .collect::<Vec<_>>();
@@ -1410,15 +1811,21 @@ pub fn run(
                     })?;
                     let context = SinkContext::new(xdg, whitelist);
                     let oplog = OpLog::new()?;
-                    let results = trash_confirmed(entries, &paths, &context, &oplog)?;
-                    let applied = results.iter().filter(|(_, result)| result.is_ok()).count();
-                    let failed = results.len().saturating_sub(applied);
-                    app.large_files.clear_selected();
-                    app.delete_message =
-                        Some(format!("trashed {applied}; skipped/failed {failed}"));
+                    let results = trash_confirmed(pending.entries, &paths, &context, &oplog)?;
+                    app.delete_notice = None;
+                    if app.apply_delete_results(results, &pending.sizes) {
+                        restart_analyzer_scan(
+                            path,
+                            &mut reports,
+                            &mut active_cancel,
+                            &mut refresh_worker,
+                            &mut app,
+                        )?;
+                    }
                 }
                 KeyCode::Char('n') | KeyCode::Esc if app.pending_delete.is_some() => {
                     app.pending_delete = None;
+                    app.confirmation_scroll = 0;
                 }
                 _ if app.pending_delete.is_some() => {}
                 KeyCode::Char('q') => break,
@@ -1443,29 +1850,47 @@ pub fn run(
                     app.large_files.move_selection(1)
                 }
                 KeyCode::Char(' ') if app.show_large_files && !app.large_files.is_filtering() => {
-                    app.large_files.toggle_selected()
+                    if !app.scanning {
+                        app.large_files.toggle_selected()
+                    }
                 }
-                KeyCode::Char('d') if app.show_large_files && !app.large_files.is_filtering() => {
-                    let mut entries = Vec::new();
-                    let mut capture_failed = false;
-                    for path in app.large_files.selected_paths() {
-                        match Identity::capture(&path) {
-                            Ok(identity) => entries.push((path, identity)),
-                            Err(_) => {
-                                capture_failed = true;
-                                break;
-                            }
+                KeyCode::Char('d')
+                    if app.show_large_files && !app.large_files.is_filtering() && !app.scanning =>
+                {
+                    match app.prepare_large_delete() {
+                        Ok(Some(pending)) => {
+                            app.pending_delete = Some(pending);
+                            app.delete_notice = None;
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            app.delete_notice = Some(
+                                "a selected path is unavailable; refresh and select again"
+                                    .to_owned(),
+                            );
                         }
                     }
-                    if capture_failed {
-                        app.delete_message = Some(
-                            "a selected path is unavailable; refresh and select again".to_owned(),
-                        );
-                        continue;
-                    }
-                    if !entries.is_empty() {
-                        app.pending_delete = Some(entries);
-                        app.delete_message = None;
+                }
+                KeyCode::Char(' ') if !app.show_large_files => {
+                    app.toggle_current_selected();
+                }
+                KeyCode::Char('d')
+                    if !app.show_large_files
+                        && !app.scanning
+                        && !(app.overview && app.navigator.at_root()) =>
+                {
+                    match app.prepare_main_delete() {
+                        Ok(Some(pending)) => {
+                            app.pending_delete = Some(pending);
+                            app.delete_notice = None;
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            app.delete_notice = Some(
+                                "a selected path is unavailable; refresh and select again"
+                                    .to_owned(),
+                            );
+                        }
                     }
                 }
                 KeyCode::Enter if app.show_large_files && app.large_files.is_filtering() => {
@@ -1495,27 +1920,13 @@ pub fn run(
                 KeyCode::Char('t') if !app.scanning => app.show_large_files = !app.show_large_files,
                 KeyCode::Char('/') if app.show_large_files => app.large_files.begin_filter(),
                 KeyCode::Char('r') => {
-                    active_cancel.store(true, Ordering::Relaxed);
-                    if let Some(worker) = refresh_worker.take() {
-                        worker
-                            .join()
-                            .map_err(|_| io::Error::other("refresh scanner worker panicked"))?;
-                    }
-                    let next_cancel = Arc::new(AtomicBool::new(false));
-                    let worker_cancel = Arc::clone(&next_cancel);
-                    let worker_path = path.to_owned();
-                    let (sender, receiver) = std::sync::mpsc::channel();
-                    refresh_worker = Some(
-                        std::thread::Builder::new()
-                            .name("mole-refresh".to_owned())
-                            .spawn(move || {
-                                scan::scan_progressive(&worker_path, &worker_cancel, sender)
-                            })?,
-                    );
-                    active_cancel = next_cancel;
-                    reports = receiver;
-                    app.scanning = true;
-                    app.scan_failed = false;
+                    restart_analyzer_scan(
+                        path,
+                        &mut reports,
+                        &mut active_cancel,
+                        &mut refresh_worker,
+                        &mut app,
+                    )?;
                 }
                 _ => {}
             }

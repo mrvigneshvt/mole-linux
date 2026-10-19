@@ -449,16 +449,18 @@ fn render_summary(
         "Summed allocated size of applied items: {}",
         format_size(summary.allocated_applied)
     );
-    match (before, after) {
-        (Ok(before), Ok(after)) if after >= before => println!(
-            "Measured statvfs free-space delta: +{} bytes",
-            after - before
-        ),
-        (Ok(before), Ok(after)) => println!(
-            "Measured statvfs free-space delta: -{} bytes",
-            before - after
-        ),
-        _ => println!("Measured statvfs free-space delta: unavailable"),
+    if !dry_run {
+        match (before, after) {
+            (Ok(before), Ok(after)) if after >= before => println!(
+                "Measured statvfs free-space delta: +{} bytes",
+                after - before
+            ),
+            (Ok(before), Ok(after)) => println!(
+                "Measured statvfs free-space delta: -{} bytes",
+                before - after
+            ),
+            _ => println!("Measured statvfs free-space delta: unavailable"),
+        }
     }
     if summary.cancelled {
         println!("Cleanup cancelled; remaining items were skipped");

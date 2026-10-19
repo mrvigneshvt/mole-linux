@@ -168,3 +168,51 @@ fn clean_dryrun_scenario_keeps_every_honeypot_canary() {
         .assert_canaries_intact()
         .expect("canaries intact after clean preview");
 }
+
+#[test]
+fn clean_browser_dryrun_keeps_browser_caches_and_every_canary() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let home = temp.path().join("home");
+    let fixture = fixtures::HomeFixture::build(&home).expect("build honeypot");
+    let scenario = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/honeypot/scenarios/clean-browser-dryrun.sh");
+    let output = Command::new("bash")
+        .arg(scenario)
+        .arg(env!("CARGO_BIN_EXE_mole-linux"))
+        .isolated_home(&home)
+        .output()
+        .expect("run browser cache preview");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fixture
+        .assert_canaries_intact()
+        .expect("canaries intact after browser cache preview");
+}
+
+#[test]
+fn clean_browser_apply_removes_only_browser_caches_and_keeps_every_canary() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let home = temp.path().join("home");
+    let fixture = fixtures::HomeFixture::build(&home).expect("build honeypot");
+    let scenario = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/honeypot/scenarios/clean-browser-apply.sh");
+    let output = Command::new("bash")
+        .arg(scenario)
+        .arg(env!("CARGO_BIN_EXE_mole-linux"))
+        .isolated_home(&home)
+        .output()
+        .expect("run browser cache cleanup");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fixture
+        .assert_canaries_intact()
+        .expect("canaries intact after browser cache cleanup");
+}

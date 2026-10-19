@@ -5,7 +5,7 @@ mod home_support;
 use home_support::CommandHomeExt;
 
 #[test]
-fn clean_dry_run_reports_preview_and_measured_space_without_mutating_home() {
+fn clean_dry_run_reports_preview_without_claiming_measured_space() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let home = temp.path().join("home");
     fs::create_dir(&home).expect("create temporary home");
@@ -27,7 +27,7 @@ fn clean_dry_run_reports_preview_and_measured_space_without_mutating_home() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Clean preview"), "{stdout}");
     assert!(
-        stdout.contains("Measured statvfs free-space delta"),
+        !stdout.contains("Measured statvfs free-space delta"),
         "{stdout}"
     );
     assert!(cache.join("canary").exists(), "dry-run changed the target");
@@ -69,9 +69,9 @@ fn clean_accepts_rule_filters_and_records_a_zero_rule_preview() {
             "clean",
             "--dry-run",
             "--categories",
-            "user-cache",
+            "browser",
             "--select",
-            "thumbnail-cache",
+            "browser-cache",
             "--exclude",
             "browser-cache",
         ])

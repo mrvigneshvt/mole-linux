@@ -15,7 +15,11 @@ dir	.local/share/Trash/info
 dir	.config/chromium/Default
 dir	.config/google-chrome/Default
 dir	.cache/chromium/Default/Cache
+dir	.cache/BraveSoftware/Brave-Browser/Default/Cache
 dir	.cache/mozilla/firefox/x.default-release/cache2
+target-file	.cache/chromium/Default/Cache/mole-linux-cache-fixture
+target-file	.cache/BraveSoftware/Brave-Browser/Default/Cache/mole-linux-cache-fixture
+target-file	.cache/mozilla/firefox/x.default-release/cache2/mole-linux-cache-fixture
 dir	.cache/thumbnails
 dir	.cache/yay/pkg-build
 dir	.config/mole-linux/whitelist-protected

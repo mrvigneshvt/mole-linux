@@ -66,6 +66,10 @@ fn project_detection_and_vendor_protection_follow_owner_evidence() {
     fs::write(go.join("go.mod"), "module example\n").expect("go module");
     assert!(is_protected_artifact(&go.join("vendor")));
 
+    let unknown = home.path().join("unknown");
+    fs::create_dir_all(unknown.join("vendor")).expect("unknown vendor");
+    assert!(is_protected_artifact(&unknown.join("vendor")));
+
     let dotnet = home.path().join("dotnet");
     fs::create_dir_all(dotnet.join("bin/Debug")).expect("dotnet output");
     fs::write(dotnet.join("App.csproj"), "").expect("dotnet project");

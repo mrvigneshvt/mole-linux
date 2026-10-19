@@ -26,18 +26,6 @@ fn unsupported_subcommands_parse_flags_and_exit_two() {
         ),
         (
             &[
-                "installer",
-                "--dry-run",
-                "--max-depth",
-                "2",
-                "--hidden",
-                "--type",
-                "zip",
-            ],
-            33,
-        ),
-        (
-            &[
                 "uninstall",
                 "--dry-run",
                 "--list",

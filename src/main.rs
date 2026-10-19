@@ -255,7 +255,12 @@ fn run() -> io::Result<()> {
             whitelist: args.whitelist,
         }),
         Command::Purge(_) => not_implemented("purge", 31),
-        Command::Installer(_) => not_implemented("installer", 33),
+        Command::Installer(args) => mole_linux::commands::installer::run(
+            args.dry_run,
+            args.max_depth,
+            args.hidden,
+            args.r#type.as_deref(),
+        ),
         Command::Uninstall(_) => not_implemented("uninstall", 34),
         Command::Optimize(_) => not_implemented("optimize", 39),
         Command::History(args) => mole_linux::core::oplog::run(args.json, args.limit),

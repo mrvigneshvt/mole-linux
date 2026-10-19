@@ -614,6 +614,8 @@ fn system_catalog_registers_pacman_and_aur_rules_in_the_system_category() {
             "pacman-cache-uninstalled",
             "orphan-packages",
             "aur-build-dirs",
+            "flatpak-unused-system",
+            "flatpak-unused-user",
             "journal",
         ]
     );

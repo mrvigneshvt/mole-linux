@@ -11,6 +11,7 @@ use crate::rules::clean::{
     Candidate, Category, CleanRule, Discovery, DiscoveryStatus, OwnerCheck, RecoveryMode,
     RuleContext, candidate, owner_candidate_state,
 };
+use crate::rules::flatpak::{FlatpakUnusedRule, SYSTEM_INSTALLATION, Scope};
 
 pub const PACMAN_CACHE_DIR: &str = "/var/cache/pacman/pkg";
 
@@ -248,8 +249,19 @@ pub fn catalog() -> Vec<Box<dyn CleanRule>> {
         Box::new(PaccacheRule::uninstalled(PathBuf::from(PACMAN_CACHE_DIR))),
         Box::new(super::orphans::OrphanPackagesRule),
     ];
-    if let Some(xdg) = XdgPaths::from_env() {
+    let xdg = XdgPaths::from_env();
+    if let Some(xdg) = &xdg {
         rules.push(Box::new(YayBuildRule::new(xdg.cache.join("yay"))));
+    }
+    rules.push(Box::new(FlatpakUnusedRule::new(
+        Scope::System,
+        PathBuf::from(SYSTEM_INSTALLATION),
+    )));
+    if let Some(xdg) = &xdg {
+        rules.push(Box::new(FlatpakUnusedRule::new(
+            Scope::User,
+            xdg.data.join("flatpak"),
+        )));
     }
     rules
 }

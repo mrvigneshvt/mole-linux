@@ -15,6 +15,6 @@ Options:
 
 Categories and rule IDs (for --categories, --select, --exclude):
   browser      browser-cache
-  development  project-pycache, npm, pnpm, bun, corepack
-  system       coredumps, pacman-cache-keep3, pacman-cache-uninstalled, orphan-packages, aur-build-dirs, journal
+  development  project-pycache, npm, pnpm, bun, corepack, uv, pip, conda, go, mise, editor-cached-data, editor-obsolete-extensions, ruby, perl, elixir, ocaml, shell-caches, network-caches, cicd-caches, docker, docker-build-cache, pyinstaller, pyenv-cache, poetry-cache, ruff-cache, mypy-cache, pytest-cache, cargo, gradle
+  system       coredumps, pacman-cache-keep3, pacman-cache-uninstalled, orphan-packages, aur-build-dirs, flatpak-unused-system, flatpak-unused-user, journal
   user         user-essentials, trash

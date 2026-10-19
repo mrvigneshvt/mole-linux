@@ -1,6 +1,6 @@
 FROM archlinux:latest
 
-RUN pacman -Sy --noconfirm sudo pacman-contrib shadow git && pacman -Scc --noconfirm
+RUN pacman -Sy --noconfirm sudo pacman-contrib shadow git base-devel && pacman -Scc --noconfirm
 RUN useradd --create-home --shell /bin/bash mole && \
     printf 'mole ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/mole && \
     chmod 0440 /etc/sudoers.d/mole

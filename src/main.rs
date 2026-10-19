@@ -86,12 +86,16 @@ struct CliCleanArgs {
 
 #[derive(Debug, Args)]
 struct PurgeArgs {
+    /// Inspect artifacts without sending anything to Trash
     #[arg(long)]
     dry_run: bool,
+    /// Comma-separated project roots to scan
     #[arg(long)]
     paths: Option<String>,
+    /// Include empty artifact directories in the inventory
     #[arg(long)]
     include_empty: bool,
+    /// Skip the final confirmation before sending selected artifacts to Trash
     #[arg(long)]
     yes: bool,
 }

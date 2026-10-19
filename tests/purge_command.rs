@@ -11,6 +11,10 @@ use mole_linux::core::whitelist::Whitelist;
 use mole_linux::purge::{Activity, Candidate, SizeEstimate};
 use tempfile::tempdir;
 
+#[path = "support/home.rs"]
+mod home_support;
+use home_support::CommandHomeExt;
+
 fn context(home: &std::path::Path) -> SinkContext {
     let xdg =
         XdgPaths::from_values(home.to_path_buf(), None, None, None, None).expect("valid temp home");
@@ -26,6 +30,7 @@ fn reviewed(path: PathBuf, activity: Activity, protected: bool) -> ReviewedCandi
         size: SizeEstimate::Known(4096),
         cachedir_tag: false,
         selected_by_default: activity == Activity::Old && !protected,
+        unavailable_reason: None,
     })
     .expect("capture identity")
 }
@@ -298,5 +303,143 @@ fn purge_cli_dry_run_reviews_defaults_and_yes_moves_only_to_trash() {
             .expect("Trash")
             .count(),
         1
+    );
+}
+
+#[test]
+fn one_git_probe_failure_does_not_abort_healthy_root_inventory() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let home = tempdir().expect("home");
+    let config = home.path().join(".test-xdg/config/mole-linux");
+    fs::create_dir_all(&config).expect("config");
+    let bad = home.path().join("bad-repo");
+    let good = home.path().join("good-repo");
+    for repo in [&bad, &good] {
+        fs::create_dir_all(repo.join("target")).expect("artifact");
+        fs::write(repo.join("Cargo.toml"), "[package]\nname='fixture'\n").expect("marker");
+    }
+    fs::write(bad.join(".git"), "gitdir: /nonexistent\n").expect("broken git marker");
+    fs::write(good.join("target/old-file"), "x").expect("tracked artifact file");
+    age(&[&good.join("target/old-file"), &good.join("target")]);
+    let initialized = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&good)
+        .status()
+        .expect("git init");
+    assert!(initialized.success());
+    fs::write(
+        config.join("purge_paths"),
+        format!("{}\n{}\n", bad.display(), good.display()),
+    )
+    .expect("roots");
+    let real_git = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("find git");
+    let real_git = String::from_utf8(real_git.stdout)
+        .expect("git path")
+        .trim()
+        .to_owned();
+    let bin = home.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin");
+    let wrapper = bin.join("git");
+    fs::write(
+        &wrapper,
+        format!("#!/bin/sh\ncase \"$PWD\" in *bad-repo*) exit 1;; esac\nexec {real_git} \"$@\"\n"),
+    )
+    .expect("git wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("executable");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mole-linux"));
+    let scan_roots = format!("{},{}", bad.display(), good.display());
+    command.args(["purge", "--dry-run", "--paths", &scan_roots]);
+    command.isolated_home(home.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").expect("PATH"));
+    command.env("PATH", path);
+    let output = command.output().expect("run purge");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Unavailable ~/bad-repo/target"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Dry run:"));
+}
+
+#[test]
+fn all_unavailable_scan_roots_fail_the_inventory() {
+    use std::process::Command;
+
+    let home = tempdir().expect("home");
+    let invalid_root = home.path().join("not-a-directory");
+    fs::write(&invalid_root, "file").expect("invalid root");
+    let root = invalid_root.to_string_lossy().into_owned();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mole-linux"));
+    command.args(["purge", "--dry-run", "--paths", &root]);
+    command.isolated_home(home.path());
+    let output = command.output().expect("run purge");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Unavailable"), "{stderr}");
+    assert!(stderr.contains("inventory unavailable"), "{stderr}");
+}
+
+#[test]
+fn git_probe_waits_for_process_after_empty_stdout_closes() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let home = tempdir().expect("home");
+    let project = home.path().join("project");
+    fs::create_dir_all(project.join("target")).expect("artifact");
+    fs::write(project.join("Cargo.toml"), "[package]\nname='fixture'\n").expect("marker");
+    fs::write(project.join("target/output"), "generated").expect("artifact file");
+    let initialized = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&project)
+        .status()
+        .expect("git init");
+    assert!(initialized.success());
+
+    let real_git = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("find git");
+    let real_git = String::from_utf8(real_git.stdout)
+        .expect("git path")
+        .trim()
+        .to_owned();
+    let bin = home.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin");
+    let wrapper = bin.join("git");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *' ls-files '*) exec 1>&-; sleep 0.2; exit 0;; esac\nexec {real_git} \"$@\"\n"
+        ),
+    )
+    .expect("git wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("executable");
+
+    let root = project.to_string_lossy().into_owned();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mole-linux"));
+    command.args(["purge", "--dry-run", "--paths", &root]);
+    command.isolated_home(home.path());
+    command.env(
+        "PATH",
+        format!("{}:{}", bin.display(), std::env::var("PATH").expect("PATH")),
+    );
+    let output = command.output().expect("run purge");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("git probe reader disconnected"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

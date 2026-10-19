@@ -195,15 +195,21 @@ pub fn run(dry_run: bool, paths: Option<String>, include_empty: bool, yes: bool)
     let xdg = XdgPaths::from_env()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set or invalid"))?;
     let config = xdg.config.join("mole-linux/purge_paths");
-    let roots = purge::load_search_paths(&xdg.home, &config)?;
+    let roots = match paths.as_deref() {
+        Some(paths) => paths.split(',').map(PathBuf::from).collect(),
+        None => purge::load_search_paths(&xdg.home, &config)?,
+    };
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
     let mut candidates = Vec::new();
     let mut scan_errors = Vec::new();
+    let mut attempted_roots = 0_usize;
+    let mut successful_roots = 0_usize;
     for root in roots {
         match fs::symlink_metadata(&root) {
-            Ok(_) => {}
+            Ok(_) => attempted_roots += 1,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
+                attempted_roots += 1;
                 scan_errors.push((root, error));
                 continue;
             }
@@ -215,20 +221,43 @@ pub fn run(dry_run: bool, paths: Option<String>, include_empty: bool, yes: bool)
             &xdg.home,
             &mountinfo,
         ) {
-            Ok(found) => candidates.extend(found),
+            Ok(found) => {
+                successful_roots += 1;
+                candidates.extend(found);
+            }
             Err(error) => scan_errors.push((root, error)),
         }
     }
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
     candidates.dedup_by(|left, right| left.path == right.path);
+    if attempted_roots > 0 && successful_roots == 0 && !scan_errors.is_empty() {
+        for (root, error) in &scan_errors {
+            eprintln!(
+                "Unavailable {}: {}",
+                visible_path(root, &xdg.home),
+                visible_text(&error.to_string())
+            );
+        }
+        return Err(io::Error::other(
+            "Purge inventory unavailable; no artifacts were changed",
+        ));
+    }
     if candidates.is_empty() && scan_errors.is_empty() {
         println!("No project artifacts found.");
         return Ok(());
     }
     let mut reviewed = Vec::new();
     for candidate in candidates {
+        let path = candidate.path.clone();
+        if let Some(reason) = &candidate.unavailable_reason {
+            eprintln!(
+                "Unavailable {}: {}",
+                visible_path(&path, &xdg.home),
+                visible_text(reason)
+            );
+            continue;
+        }
         if include_empty || candidate.size != SizeEstimate::Known(0) {
-            let path = candidate.path.clone();
             match ReviewedCandidate::capture(candidate) {
                 Ok(item) => reviewed.push(item),
                 Err(error) => scan_errors.push((path, error)),
@@ -243,33 +272,13 @@ pub fn run(dry_run: bool, paths: Option<String>, include_empty: bool, yes: bool)
                 visible_text(&error.to_string())
             );
         }
-        return Err(io::Error::other(
-            "Purge inventory incomplete; no artifacts were changed",
-        ));
     }
     if reviewed.is_empty() {
         println!("No eligible project artifacts found.");
         return Ok(());
     }
 
-    let selected = if let Some(paths) = paths {
-        let requested = paths.split(',').map(PathBuf::from).collect::<Vec<_>>();
-        for requested_path in &requested {
-            if !reviewed
-                .iter()
-                .any(|item| item.candidate.path == *requested_path)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "path was not found in the purge inventory: {}",
-                        visible_path(requested_path, &xdg.home)
-                    ),
-                ));
-            }
-        }
-        requested
-    } else if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    let selected = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         select_interactively(&reviewed)?
     } else {
         reviewed
@@ -494,7 +503,8 @@ fn visible_path(path: &Path, home: &Path) -> String {
     let display = path.display().to_string();
     let shown = if !home.as_os_str().is_empty() && path.starts_with(home) {
         match path.strip_prefix(home) {
-            Ok(relative) => format!("~{}", relative.display()),
+            Ok(relative) if relative.as_os_str().is_empty() => "~".to_owned(),
+            Ok(relative) => format!("~/{}", relative.display()),
             Err(_) => display,
         }
     } else {
@@ -528,6 +538,7 @@ mod tests {
             size: SizeEstimate::Known(2048),
             cachedir_tag: false,
             selected_by_default: false,
+            unavailable_reason: None,
         })
         .expect("capture candidate");
         let mut terminal = Terminal::new(TestBackend::new(100, 8)).expect("test terminal");
@@ -579,6 +590,7 @@ mod tests {
                     size: SizeEstimate::Known(1024),
                     cachedir_tag: false,
                     selected_by_default: index != 0,
+                    unavailable_reason: None,
                 })
                 .expect("capture candidate"),
             );
@@ -614,6 +626,7 @@ mod tests {
             size: SizeEstimate::Known(1),
             cachedir_tag: false,
             selected_by_default: true,
+            unavailable_reason: None,
         })
         .expect("capture candidate");
         let mut terminal = Terminal::new(TestBackend::new(25, 10)).expect("test terminal");
@@ -628,5 +641,18 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(output.contains("Resize terminal"));
+    }
+}
+
+#[cfg(test)]
+mod added_display_regression {
+    use super::*;
+
+    #[test]
+    fn displayed_home_child_has_a_separator() {
+        assert_eq!(
+            visible_path(Path::new("/home/test/Workspace"), Path::new("/home/test")),
+            "~/Workspace"
+        );
     }
 }

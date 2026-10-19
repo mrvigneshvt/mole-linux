@@ -172,10 +172,39 @@ fn main() {
 fn run() -> io::Result<()> {
     let cli = Cli::parse();
     let _debug = cli.debug;
-    let command = cli.command.unwrap_or(Command::Analyze(AnalyzeArgs {
-        path: cli.path,
-        json: false,
-    }));
+    let command = match (cli.command, cli.path) {
+        (Some(command), _) => command,
+        (None, Some(path)) => Command::Analyze(AnalyzeArgs {
+            path: Some(path),
+            json: false,
+        }),
+        (None, None) => match tui::run_menu()? {
+            Some(tui::MenuChoice::Clean) => Command::Clean(CleanArgs {
+                dry_run: false,
+                categories: None,
+                select: None,
+                exclude: None,
+                external: false,
+                whitelist: false,
+            }),
+            Some(tui::MenuChoice::Uninstall) => Command::Uninstall(UninstallArgs {
+                dry_run: false,
+                list: false,
+                permanent: false,
+                whitelist: false,
+            }),
+            Some(tui::MenuChoice::Optimize) => Command::Optimize(OptimizeArgs {
+                dry_run: false,
+                whitelist: false,
+            }),
+            Some(tui::MenuChoice::Analyze) => Command::Analyze(AnalyzeArgs {
+                path: None,
+                json: false,
+            }),
+            Some(tui::MenuChoice::Status) => Command::Status(StatusArgs::interactive()),
+            None => return Ok(()),
+        },
+    };
 
     match command {
         Command::Analyze(args) => {

@@ -11,6 +11,7 @@ use clap_complete::{generate, shells};
 use mole_linux::commands::clean::CleanArgs;
 use mole_linux::commands::status::StatusArgs;
 use mole_linux::core::fsutil::{atomic_replace, resolve_symlink_chain};
+use mole_linux::core::privilege::ensure_not_root;
 use mole_linux::{commands::snapshots, scan, tui};
 
 #[derive(Debug, Parser)]
@@ -177,6 +178,8 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
+    ensure_not_root(rustix::process::geteuid().as_raw())
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
     let cli = Cli::parse();
     let _debug = cli.debug;
     let command = match (cli.command, cli.path) {

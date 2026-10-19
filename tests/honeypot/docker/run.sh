@@ -39,6 +39,19 @@ if [[ "$scenario" == analyze-delete ]]; then
     fi
     docker_args+=(--cap-add SYS_ADMIN --mount "type=bind,src=$test_binary,dst=/usr/local/bin/analyze-delete-tests,readonly")
 fi
+if [[ "$scenario" == privilege-sudo ]]; then
+    test_binary=
+    for candidate in "$repo_root"/target/debug/deps/privilege_honeypot-*; do
+        if [[ -x "$candidate" ]]; then
+            test_binary=$candidate
+        fi
+    done
+    if [[ -z "$test_binary" ]]; then
+        printf 'missing privilege_honeypot test binary; run cargo test --test privilege_honeypot --no-run first\n' >&2
+        exit 1
+    fi
+    docker_args+=(--mount "type=bind,src=$test_binary,dst=/usr/local/bin/privilege-honeypot-tests,readonly")
+fi
 docker run "${docker_args[@]}" \
     --mount "type=bind,src=$binary,dst=/usr/local/bin/mole-linux,readonly" \
     --mount "type=bind,src=$scenario_file,dst=/tmp/honeypot-scenario.sh,readonly" \

@@ -5,8 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use clap::CommandFactory;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, shells};
 use mole_linux::commands::clean::CleanArgs;
 use mole_linux::commands::status::StatusArgs;
@@ -68,19 +67,25 @@ struct AnalyzeArgs {
 
 #[derive(Debug, Args)]
 struct CliCleanArgs {
+    /// Preview every item without changing anything
     #[arg(long)]
     dry_run: bool,
+    /// Skip the confirmation prompt; also grants sudo consent for owner-tool actions
     #[arg(long)]
     yes: bool,
+    /// Run only these categories (comma-separated: user, browser, development, system)
     #[arg(long)]
     categories: Option<String>,
     /// Select rule IDs or categories (e.g. `trash` empties Trash (irreversible); `user` includes it)
     #[arg(long)]
     select: Option<String>,
+    /// Skip these rule IDs or categories (comma-separated)
     #[arg(long)]
     exclude: Option<String>,
+    /// Reserved for external targets; the Linux catalog has none, so this exits with an error
     #[arg(long)]
     external: bool,
+    /// Print the whitelist path and exit
     #[arg(long)]
     whitelist: bool,
 }
@@ -103,12 +108,16 @@ struct PurgeArgs {
 
 #[derive(Debug, Args)]
 struct InstallerArgs {
+    /// List installer files and change nothing
     #[arg(long)]
     dry_run: bool,
+    /// Directory depth to scan, 1-16 (default 2)
     #[arg(long)]
     max_depth: Option<u32>,
+    /// Also scan hidden (dot) directories
     #[arg(long)]
     hidden: bool,
+    /// List only one installer type: deb, rpm, appimage, pkg.tar.zst, iso, tar, zip, flatpakref
     #[arg(long)]
     r#type: Option<String>,
 }
@@ -174,6 +183,13 @@ enum Shell {
     Fish,
 }
 
+/// The CLI definition, with the `clean` footer built from the rule catalog at runtime.
+fn cli_command() -> clap::Command {
+    Cli::command().mut_subcommand("clean", |clean| {
+        clean.after_help(mole_linux::commands::clean::help_epilog())
+    })
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("mole-linux: {error}");
@@ -188,7 +204,8 @@ fn main() {
 fn run() -> io::Result<()> {
     ensure_not_root(rustix::process::geteuid().as_raw())
         .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
-    let cli = Cli::parse();
+    let cli =
+        Cli::from_arg_matches(&cli_command().get_matches()).unwrap_or_else(|error| error.exit());
     let _debug = cli.debug;
     let command = match (cli.command, cli.path) {
         (Some(command), _) => command,

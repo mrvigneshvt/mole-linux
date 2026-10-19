@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 
 use crate::core::privilege::{OwnerCommand, OwnerProgram, OwnerRun, OwnerRunner};
+use crate::core::units::{bytes_si, parse_iec_size};
 use crate::rules::clean::{Category, CleanRule, Discovery, DiscoveryStatus, Report, RuleContext};
 
 pub struct OrphanPackagesRule;
@@ -60,7 +61,7 @@ fn orphan_report(owner: &OwnerRunner) -> Report {
         match sizes.get(name).copied().flatten() {
             Some(bytes) => {
                 known_total = known_total.saturating_add(bytes);
-                lines.push(format!("  {name}: {}", format_si(bytes)));
+                lines.push(format!("  {name}: {}", bytes_si(bytes)));
             }
             None => {
                 unknown += 1;
@@ -69,11 +70,11 @@ fn orphan_report(owner: &OwnerRunner) -> Report {
         }
     }
     let total = match (unknown, names.len()) {
-        (0, _) => format!("{} installed", format_si(known_total)),
+        (0, _) => format!("{} installed", bytes_si(known_total)),
         (count, all) if count == all => "installed size unknown".to_owned(),
         _ => format!(
             "at least {} installed; {unknown} size unknown",
-            format_si(known_total)
+            bytes_si(known_total)
         ),
     };
     let mut findings = vec![format!(
@@ -136,46 +137,11 @@ fn parse_installed_sizes(output: &str) -> BTreeMap<String, Option<u64>> {
             }
             "Installed Size" => {
                 if let Some(name) = &current {
-                    sizes.insert(name.clone(), parse_pacman_size(value.trim()));
+                    sizes.insert(name.clone(), parse_iec_size(value.trim()));
                 }
             }
             _ => {}
         }
     }
     sizes
-}
-
-/// pacman prints binary units (`1.50 MiB`). Integer arithmetic keeps the value exact to two places.
-fn parse_pacman_size(value: &str) -> Option<u64> {
-    let (number, unit) = value.split_once(' ')?;
-    let multiplier: u64 = match unit {
-        "B" => 1,
-        "KiB" => 1 << 10,
-        "MiB" => 1 << 20,
-        "GiB" => 1 << 30,
-        "TiB" => 1 << 40,
-        _ => return None,
-    };
-    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
-    let whole: u64 = whole.parse().ok()?;
-    let fractional = if fraction.is_empty() {
-        0
-    } else {
-        let digits: u64 = fraction.parse().ok()?;
-        let scale = 10_u64.checked_pow(u32::try_from(fraction.len()).ok()?)?;
-        digits.checked_mul(multiplier)? / scale
-    };
-    whole.checked_mul(multiplier)?.checked_add(fractional)
-}
-
-/// SI units (kB/MB/GB) for disk sizes, one decimal, truncated.
-fn format_si(bytes: u64) -> String {
-    const UNITS: [(u64, &str); 3] = [(1_000_000_000, "GB"), (1_000_000, "MB"), (1_000, "kB")];
-    for (scale, unit) in UNITS {
-        if bytes >= scale {
-            let tenths = bytes / (scale / 10);
-            return format!("{}.{} {unit}", tenths / 10, tenths % 10);
-        }
-    }
-    format!("{bytes} B")
 }

@@ -224,8 +224,10 @@ impl OwnerRunner {
             ));
         }
 
+        // Queries are parsed as English with '.' decimals (e.g. paccache's "disk space saved").
         let mut child = match Process::new(&program)
             .args(&cmd.args)
+            .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

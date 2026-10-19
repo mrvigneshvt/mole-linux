@@ -8,6 +8,7 @@ use mole_linux::core::oplog::OpLog;
 use mole_linux::core::paths::XdgPaths;
 use mole_linux::core::proc::ProcessState;
 use mole_linux::core::sink::SinkContext;
+use mole_linux::core::units::bytes_si;
 use mole_linux::core::whitelist::Whitelist;
 use mole_linux::rules::clean::{CleanRule, RuleContext, catalog};
 
@@ -161,11 +162,11 @@ fn browser_runner_prints_measured_sizes_even_when_owner_state_skips_cleanup() {
         .find(|line| line.contains(".cache/chromium"))
         .expect("Chromium candidate row");
     assert!(
-        row.contains(&format!("logical={} bytes", expected.apparent)),
+        row.contains(&format!("logical={}", bytes_si(expected.apparent))),
         "{row}"
     );
     assert!(
-        row.contains(&format!("allocated={} bytes", expected.allocated)),
+        row.contains(&format!("allocated={}", bytes_si(expected.allocated))),
         "{row}"
     );
 }

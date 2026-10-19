@@ -41,6 +41,48 @@ fn no_args_opens_menu_and_q_restores_terminal_in_tmux() {
     assert!(pane.contains("Clean"));
     assert!(pane.contains("Analyze"));
     let sent = Command::new("tmux")
+        .args(["send-keys", "-l", "-t", &session, "/sta"])
+        .status()
+        .expect("type menu search");
+    assert!(sent.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let output = Command::new("tmux")
+            .args(["capture-pane", "-p", "-t", &session])
+            .output()
+            .expect("capture filtered menu");
+        pane = String::from_utf8_lossy(&output.stdout).into_owned();
+        if pane.contains("Commands — search: sta") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        pane.contains("Commands — search: sta"),
+        "query not visible:\n{pane}"
+    );
+    assert!(pane.contains("Status  Monitor system health"));
+    assert!(!pane.contains("Clean  Free up disk space"));
+    let sent = Command::new("tmux")
+        .args(["send-keys", "-t", &session, "Escape"])
+        .status()
+        .expect("clear menu search");
+    assert!(sent.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let output = Command::new("tmux")
+            .args(["capture-pane", "-p", "-t", &session])
+            .output()
+            .expect("capture cleared menu");
+        pane = String::from_utf8_lossy(&output.stdout).into_owned();
+        if pane.contains("Clean  Free up disk space") && !pane.contains("search: sta") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(pane.contains("Clean  Free up disk space"));
+    assert!(!pane.contains("search: sta"));
+    let sent = Command::new("tmux")
         .args(["send-keys", "-t", &session, "q"])
         .status()
         .expect("send quit key");

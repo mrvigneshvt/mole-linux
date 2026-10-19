@@ -323,7 +323,7 @@ mod tests {
         assert!(rendered.contains("Analyze"));
         assert!(rendered.contains("Q Quit"));
 
-        app.query.push_str("status");
+        app.query.push_str("sta");
         app.searching = true;
         terminal
             .draw(|frame| super::render_menu(frame, &app))
@@ -335,9 +335,24 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Search: status_"));
+        assert!(rendered.contains("Commands — search: sta"));
         assert!(rendered.contains("Monitor system health"));
         assert!(!rendered.contains("Free up disk space"));
+
+        app.clear_search();
+        terminal
+            .draw(|frame| super::render_menu(frame, &app))
+            .expect("render menu after Esc clears search");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Commands"));
+        assert!(!rendered.contains("search: sta"));
+        assert!(!rendered.contains("Search: sta_"));
     }
 }
 use std::cmp::Reverse;
@@ -402,6 +417,12 @@ struct MenuApp {
 }
 
 impl MenuApp {
+    fn clear_search(&mut self) {
+        self.query.clear();
+        self.searching = false;
+        self.selected = 0;
+    }
+
     fn visible(&self) -> Vec<usize> {
         MENU_CHOICES
             .iter()
@@ -461,8 +482,13 @@ fn render_menu(frame: &mut Frame<'_>, app: &MenuApp) {
     let selected = visible.iter().position(|index| *index == app.selected);
     let mut state = ListState::default();
     state.select(selected);
+    let title = if app.searching {
+        format!("Commands — search: {}", app.query)
+    } else {
+        "Commands".to_owned()
+    };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Commands"))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_symbol("> ")
         .highlight_style(
             Style::default()
@@ -516,14 +542,11 @@ pub fn run_menu() -> io::Result<Option<MenuChoice>> {
             }
             KeyCode::Char('q') if !app.searching && app.query.is_empty() => return Ok(None),
             KeyCode::Esc if app.searching => {
-                app.query.clear();
-                app.searching = false;
-                app.selected = 0;
+                app.clear_search();
             }
             KeyCode::Esc if app.query.is_empty() => return Ok(None),
             KeyCode::Esc => {
-                app.query.clear();
-                app.selected = 0;
+                app.clear_search();
             }
             KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
